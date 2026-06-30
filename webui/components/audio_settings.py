@@ -9,7 +9,7 @@ from app.models.schema import AudioVolumeDefaults
 from app.utils import utils
 
 
-INDEXTTS_REFERENCE_AUDIO_SOURCE_DIR = "/Users/viccy/Downloads/tts-mp3-clone/mp3"
+INDEXTTS_REFERENCE_AUDIO_SOURCE_DIR = utils.resource_dir("tts_refs")
 INDEXTTS_REFERENCE_AUDIO_COPY_SUBDIR = "indextts_refs"
 INDEXTTS_REFERENCE_AUDIO_MAP = [
     ("yingshijieshuo-zh-male.mp3", "影视解说", "Film Narration"),
@@ -36,7 +36,7 @@ INDEXTTS_REFERENCE_AUDIO_MAP = [
     ("sarah-en-female.mp3", "莎拉", "Sarah"),
 ]
 INDEXTTS_REFERENCE_AUDIO_EXTENSIONS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")
-BGM_RESOURCE_DIR = "/Users/viccy/Downloads/tts-mp3-clone/bgms-safe"
+BGM_RESOURCE_DIR = utils.resource_dir("songs")
 BGM_TRACKS_JSON = os.path.join(BGM_RESOURCE_DIR, "tracks.json")
 BGM_UPLOAD_SUBDIR = "uploaded_bgms"
 BGM_AUDIO_EXTENSIONS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")
@@ -44,6 +44,7 @@ LOCAL_TTS_ENGINES = {
     config.INDEXTTS_ENGINE,
     config.INDEXTTS2_ENGINE,
     config.OMNIVOICE_ENGINE,
+    config.VOXCPM2_ENGINE,
 }
 
 
@@ -64,6 +65,7 @@ def get_tts_engine_options(tr=lambda key: key):
         config.INDEXTTS_ENGINE: config.INDEXTTS_DISPLAY_NAME,
         config.INDEXTTS2_ENGINE: config.INDEXTTS2_DISPLAY_NAME,
         config.OMNIVOICE_ENGINE: config.OMNIVOICE_DISPLAY_NAME,
+        config.VOXCPM2_ENGINE: config.VOXCPM2_DISPLAY_NAME,
         "edge_tts": "Edge TTS",
         "qwen3_tts": tr("Tongyi Qwen3 TTS"),
         "tencent_tts": tr("Tencent Cloud TTS"),
@@ -134,6 +136,12 @@ def get_tts_engine_descriptions(tr=lambda key: key):
             "title": config.OMNIVOICE_DISPLAY_NAME,
             "features": tr("OmniVoice features"),
             "use_case": tr("OmniVoice use case"),
+            "registration": None
+        },
+        config.VOXCPM2_ENGINE: {
+            "title": config.VOXCPM2_DISPLAY_NAME,
+            "features": tr("VoxCPM2 features"),
+            "use_case": tr("VoxCPM2 use case"),
             "registration": None
         },
         "doubaotts": {
@@ -579,6 +587,8 @@ def render_tts_settings(tr):
         render_indextts2_tts_settings(tr)
     elif selected_engine == config.OMNIVOICE_ENGINE:
         render_omnivoice_tts_settings(tr)
+    elif selected_engine == config.VOXCPM2_ENGINE:
+        render_voxcpm2_tts_settings(tr)
     elif selected_engine == "doubaotts":
         render_doubaotts_settings(tr)
 
@@ -1449,6 +1459,103 @@ def render_omnivoice_tts_settings(tr):
     st.session_state["voice_pitch"] = 1.0
 
 
+def render_voxcpm2_tts_settings(tr):
+    """Render VoxCPM2 TTS settings."""
+    voxcpm2_config = config.voxcpm2
+
+    api_url = st.text_input(
+        tr("VoxCPM2 API URL"),
+        value=voxcpm2_config.get("api_url", "http://127.0.0.1:8808"),
+        help=tr("VoxCPM2 API URL Help"),
+        placeholder="http://127.0.0.1:8808",
+    )
+
+    reference_audio_source, reference_audio = render_indextts_reference_audio_selector(
+        tr,
+        voxcpm2_config,
+        "voxcpm2",
+    )
+
+    prompt_text = st.text_area(
+        tr("VoxCPM2 Prompt Text"),
+        value=voxcpm2_config.get("prompt_text", ""),
+        help=tr("VoxCPM2 Prompt Text Help"),
+        placeholder=tr("VoxCPM2 Prompt Text Placeholder"),
+        height=90,
+    )
+    use_prompt_text = st.checkbox(
+        tr("VoxCPM2 Use Prompt Text"),
+        value=bool(voxcpm2_config.get("use_prompt_text", bool(voxcpm2_config.get("prompt_text", "")))),
+        help=tr("VoxCPM2 Use Prompt Text Help"),
+    )
+    control_instruction = st.text_area(
+        tr("VoxCPM2 Control Instruction"),
+        value=voxcpm2_config.get("control_instruction", ""),
+        help=tr("VoxCPM2 Control Instruction Help"),
+        placeholder=tr("VoxCPM2 Control Instruction Placeholder"),
+        height=70,
+    )
+
+    with st.expander(tr("Advanced Parameters"), expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            cfg_value = st.slider(
+                "CFG Value",
+                min_value=1.0,
+                max_value=3.0,
+                value=float(voxcpm2_config.get("cfg_value", 2.0)),
+                step=0.1,
+                help=tr("VoxCPM2 CFG Value Help"),
+            )
+            inference_timesteps = st.slider(
+                tr("VoxCPM2 DIT Steps"),
+                min_value=4,
+                max_value=30,
+                value=int(voxcpm2_config.get("inference_timesteps", 10)),
+                step=1,
+                help=tr("VoxCPM2 DIT Steps Help"),
+            )
+        with col2:
+            normalize = st.checkbox(
+                tr("VoxCPM2 Normalize"),
+                value=bool(voxcpm2_config.get("normalize", False)),
+                help=tr("VoxCPM2 Normalize Help"),
+            )
+            denoise = st.checkbox(
+                tr("VoxCPM2 Denoise"),
+                value=bool(voxcpm2_config.get("denoise", False)),
+                help=tr("VoxCPM2 Denoise Help"),
+            )
+            timeout = st.number_input(
+                tr("VoxCPM2 Request Timeout"),
+                min_value=30,
+                max_value=1800,
+                value=int(voxcpm2_config.get("timeout", 300)),
+                step=30,
+                help=tr("VoxCPM2 Request Timeout Help"),
+            )
+
+    with st.expander(tr("VoxCPM2 Usage Instructions Title"), expanded=False):
+        st.markdown(tr("VoxCPM2 Usage Instructions"))
+
+    config.voxcpm2["api_url"] = api_url
+    config.voxcpm2["reference_audio_source"] = reference_audio_source
+    config.voxcpm2["reference_audio"] = reference_audio
+    config.voxcpm2["prompt_text"] = prompt_text
+    config.voxcpm2["use_prompt_text"] = use_prompt_text
+    config.voxcpm2["control_instruction"] = control_instruction
+    config.voxcpm2["cfg_value"] = cfg_value
+    config.voxcpm2["inference_timesteps"] = inference_timesteps
+    config.voxcpm2["dit_steps"] = inference_timesteps
+    config.voxcpm2["normalize"] = normalize
+    config.voxcpm2["denoise"] = denoise
+    config.voxcpm2["timeout"] = int(timeout)
+
+    if reference_audio:
+        config.ui["voice_name"] = f"{config.VOXCPM2_VOICE_PREFIX}{reference_audio}"
+    st.session_state["voice_rate"] = 1.0
+    st.session_state["voice_pitch"] = 1.0
+
 def render_doubaotts_settings(tr):
     """渲染豆包语音 TTS 设置"""
     # AK 输入
@@ -1751,6 +1858,12 @@ def render_voice_preview_new(tr, selected_engine):
                 voice_name = f"{config.OMNIVOICE_VOICE_PREFIX}{mode}"
             voice_rate = config.omnivoice.get("speed", 1.0)
             voice_pitch = 1.0
+        elif selected_engine == config.VOXCPM2_ENGINE:
+            reference_audio = config.voxcpm2.get("reference_audio", "")
+            if reference_audio:
+                voice_name = f"{config.VOXCPM2_VOICE_PREFIX}{reference_audio}"
+            voice_rate = 1.0  # The current VoxCPM2 API does not expose speed control.
+            voice_pitch = 1.0
         elif selected_engine == "doubaotts":
             voice_type = config.ui.get("doubaotts_voice_type", "BV700_streaming")
             voice_name = voice_type
@@ -1767,6 +1880,7 @@ def render_voice_preview_new(tr, selected_engine):
                 config.INDEXTTS_ENGINE,
                 config.INDEXTTS2_ENGINE,
                 config.OMNIVOICE_ENGINE,
+                config.VOXCPM2_ENGINE,
             ) else "audio/mp3"
             audio_extension = ".wav" if audio_format == "audio/wav" else ".mp3"
             audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}{audio_extension}")

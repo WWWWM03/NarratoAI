@@ -7,6 +7,7 @@ OpenAI 兼容提供商实现
 import asyncio
 import io
 import base64
+import inspect
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -129,6 +130,17 @@ class _OpenAICompatibleBase:
             max_retries=max_retries,
         )
 
+    async def _close_client(self, client: AsyncOpenAI):
+        close_func = getattr(client, "close", None) or getattr(client, "aclose", None)
+        if not close_func:
+            return
+        try:
+            result = close_func()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.debug(f"OpenAI 兼容客户端关闭失败: {exc}")
+
 
 class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider):
     """OpenAI 兼容视觉模型提供商。"""
@@ -220,6 +232,8 @@ class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider)
         except Exception as exc:
             logger.error(f"OpenAI 兼容接口调用失败: {exc}")
             raise APICallError(f"调用失败: {exc}")
+        finally:
+            await self._close_client(client)
 
     def _image_to_base64(self, img: PIL.Image.Image) -> str:
         img_buffer = io.BytesIO()
@@ -348,6 +362,8 @@ class OpenAICompatibleTextProvider(_OpenAICompatibleBase, TextModelProvider):
         except Exception as exc:
             logger.error(f"OpenAI 兼容接口调用失败: {exc}")
             raise APICallError(f"调用失败: {exc}")
+        finally:
+            await self._close_client(client)
 
     async def generate_text_stream(
         self,
@@ -424,6 +440,8 @@ class OpenAICompatibleTextProvider(_OpenAICompatibleBase, TextModelProvider):
         except Exception as exc:
             logger.error(f"OpenAI 兼容接口流式调用失败: {exc}")
             raise APICallError(f"流式调用失败: {exc}")
+        finally:
+            await self._close_client(client)
 
     async def _make_api_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return payload

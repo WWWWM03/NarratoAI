@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import math
+import re
 import time
 import traceback
 import pandas as pd
@@ -33,6 +34,8 @@ MODE_SHORT = "short"
 MODE_SHORT_SUMMARY = "summary"
 MODE_FILM_SUMMARY = "film_summary"
 SUMMARY_SCRIPT_MODES = {MODE_SHORT_SUMMARY, MODE_FILM_SUMMARY}
+NARRATION_SCOPE_OVERALL = "overall"
+NARRATION_SCOPE_EPISODE = "episode"
 VIDEO_UPLOAD_TYPES = ["mp4", "mov", "avi", "flv", "mkv", "mpeg4"]
 VIDEO_GLOB_PATTERNS = [f"*.{suffix}" for suffix in VIDEO_UPLOAD_TYPES]
 SHORT_DRAMA_NARRATION_LANGUAGE_OPTIONS = [
@@ -156,8 +159,20 @@ def _normalize_video_paths(paths):
     return normalized_paths
 
 
+def _natural_sort_key(path):
+    name = os.path.basename(str(path or "")).lower()
+    return [
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", name)
+    ]
+
+
+def _sort_media_paths(paths):
+    return sorted(_normalize_video_paths(paths), key=_natural_sort_key)
+
+
 def _set_video_origin_state(paths, params=None):
-    video_paths = _normalize_video_paths(paths)
+    video_paths = _sort_media_paths(paths)
     first_video_path = video_paths[0] if video_paths else ""
     st.session_state['video_origin_paths'] = video_paths
     st.session_state['video_origin_path'] = first_video_path
@@ -251,7 +266,7 @@ def _selected_subtitle_paths():
 
 
 def _set_subtitle_state(subtitle_paths):
-    subtitle_paths = _normalize_video_paths(subtitle_paths)
+    subtitle_paths = _sort_media_paths(subtitle_paths)
     subtitle_content, subtitle_contents = _build_combined_subtitle_content(
         subtitle_paths,
         _selected_video_paths(),
@@ -275,6 +290,40 @@ def _short_drama_plot_analysis_signature(subtitle_paths, video_theme, web_search
         ensure_ascii=False,
         sort_keys=True,
     )
+
+
+def _validate_script_video_sources(script_data, video_paths):
+    video_paths = _selected_video_paths() if video_paths is None else _normalize_video_paths(video_paths)
+    if not video_paths or not isinstance(script_data, list):
+        return []
+
+    errors = []
+    for index, item in enumerate(script_data, start=1):
+        if not isinstance(item, dict):
+            continue
+
+        video_id = item.get("video_id") or item.get("video_index")
+        if video_id in ("", None):
+            continue
+        try:
+            video_id = int(video_id)
+        except (TypeError, ValueError):
+            errors.append(f"第 {index} 个片段 video_id 不是有效数字")
+            continue
+
+        if video_id < 1 or video_id > len(video_paths):
+            errors.append(f"第 {index} 个片段 video_id={video_id} 超出已选视频数量 {len(video_paths)}")
+            continue
+
+        video_name = item.get("video_name") or item.get("source_video")
+        if video_name:
+            expected_name = os.path.basename(video_paths[video_id - 1])
+            if os.path.basename(str(video_name)) != expected_name:
+                errors.append(
+                    f"第 {index} 个片段 video_name 应为 {expected_name}，当前为 {video_name}"
+                )
+
+    return errors
 
 
 def _summary_mode_config(script_path=None):
@@ -320,6 +369,41 @@ def _resolve_short_drama_type():
     return _resolve_summary_type(SUMMARY_MODE_CONFIGS[MODE_SHORT_SUMMARY])
 
 
+def _infer_cover_name_from_selected_videos():
+    video_paths = _selected_video_paths()
+    if not video_paths:
+        return ""
+    file_name = os.path.splitext(os.path.basename(video_paths[0]))[0]
+    return file_name.replace(".", " ").replace("_", " ").strip()
+
+
+def _sync_cover_name_from_work_name(work_name):
+    st.session_state["cover_name"] = str(work_name or "").strip()
+
+
+def _render_cover_name_input(tr, default_name=""):
+    if not config.ui.get("cover_enabled", False):
+        return
+
+    default_name = str(default_name or "").strip()
+    if "cover_name_input" not in st.session_state:
+        st.session_state["cover_name_input"] = (
+            st.session_state.get("cover_name")
+            or config.ui.get("cover_name", "")
+            or default_name
+        )
+    elif not st.session_state.get("cover_name_input") and default_name:
+        st.session_state["cover_name_input"] = default_name
+
+    cover_name = st.text_input(
+        tr("Cover Work Name"),
+        key="cover_name_input",
+        placeholder=tr("Cover Work Name Placeholder"),
+        help=tr("Cover Work Name Help"),
+    )
+    st.session_state["cover_name"] = str(cover_name or "").strip()
+
+
 def render_script_panel(tr):
     """渲染脚本配置面板"""
     with st.container(border=True):
@@ -350,6 +434,9 @@ def render_script_panel(tr):
             pass
 
         # 渲染脚本操作按钮
+        if script_path not in [MODE_AUTO, MODE_SHORT] and script_path not in SUMMARY_SCRIPT_MODES:
+            _render_cover_name_input(tr, _infer_cover_name_from_selected_videos())
+
         render_script_buttons(tr, params)
 
 
@@ -584,28 +671,44 @@ def render_video_file(tr, params):
         for suffix in VIDEO_GLOB_PATTERNS:
             video_files.extend(glob.glob(os.path.join(utils.video_dir(), suffix)))
 
-        video_files = sorted(video_files, key=os.path.getctime, reverse=True)
-        saved_video_path = st.session_state.get('video_origin_path', '')
-        selected_video_path = st.session_state.get('resource_video_selection')
-        if selected_video_path not in video_files:
-            st.session_state['resource_video_selection'] = (
-                saved_video_path if saved_video_path in video_files else None
-            )
+        video_files = _sort_media_paths(video_files)
+        saved_video_paths = [
+            path for path in _selected_video_paths()
+            if path in video_files
+        ]
+        selected_video_paths = st.session_state.get('resource_video_selection')
+        if isinstance(selected_video_paths, str):
+            selected_video_paths = [selected_video_paths]
+        if not isinstance(selected_video_paths, list):
+            selected_video_paths = []
+        selected_video_paths = [
+            path for path in selected_video_paths
+            if path in video_files
+        ]
+        if selected_video_paths != st.session_state.get('resource_video_selection'):
+            st.session_state['resource_video_selection'] = selected_video_paths or saved_video_paths
+        elif 'resource_video_selection' not in st.session_state and saved_video_paths:
+            st.session_state['resource_video_selection'] = saved_video_paths
 
         def format_video_name(path):
             return path.replace(config.root_dir, "")
 
-        video_path = st.selectbox(
+        video_paths = st.multiselect(
             tr("Select Video"),
             options=video_files,
-            index=None,
             placeholder=tr("Choose a video file"),
             format_func=format_video_name,
             key="resource_video_selection",
         )
 
-        if video_path:
-            _set_video_origin_state([video_path], params)
+        if video_paths:
+            _set_video_origin_state(video_paths, params)
+            st.info(
+                tr("Selected videos for processing").format(
+                    count=len(_selected_video_paths()),
+                    files=_format_file_list_for_display(_selected_video_paths()),
+                )
+            )
         else:
             _set_video_origin_state([], params)
             if not video_files:
@@ -709,6 +812,7 @@ def render_short_generate_options(tr):
 def render_video_details(tr):
     """画面解说 渲染视频主题和提示词"""
     video_theme = st.text_input(tr("Video Theme"))
+    _sync_cover_name_from_work_name(video_theme)
     custom_prompt = st.text_area(
         tr("Generation Prompt"),
         value=st.session_state.get('video_plot', ''),
@@ -757,6 +861,7 @@ def summary_narration_panel(tr, summary_config):
     plot_source_key = _summary_state_key(summary_config, "plot_analysis_subtitle_path")
     plot_signature_key = _summary_state_key(summary_config, "plot_analysis_signature")
     pending_plot_key = _summary_state_key(summary_config, "pending_plot_analysis")
+    narration_scope_key = _summary_state_key(summary_config, "narration_scope")
 
     st.markdown(
         f"""
@@ -812,6 +917,7 @@ def summary_narration_panel(tr, summary_config):
     name_cols = st.columns([3.4, 1.1, 2], vertical_alignment="bottom")
     with name_cols[0]:
         video_theme = st.text_input(tr(summary_config["title_label_key"]))
+        _sync_cover_name_from_work_name(video_theme)
     with name_cols[1]:
         web_search_enabled = st.toggle(
             tr("联网搜索"),
@@ -867,6 +973,7 @@ def summary_narration_panel(tr, summary_config):
                 search_keywords=summary_config["search_keywords"],
                 empty_title_message_key=summary_config["empty_title_message_key"],
                 web_search_context_description=summary_config["web_search_context_description"],
+                narration_scope=st.session_state.get(narration_scope_key, NARRATION_SCOPE_OVERALL),
             )
         if plot_analysis:
             st.session_state[plot_analysis_key] = plot_analysis
@@ -934,6 +1041,56 @@ def render_subtitle_preview(tr):
         )
 
 
+def _save_uploaded_subtitle_files(tr, subtitle_files):
+    subtitle_signature = _uploaded_files_signature(subtitle_files)
+    if (
+        st.session_state.get('subtitle_file_processed', False)
+        and st.session_state.get('uploaded_subtitle_signature') == subtitle_signature
+    ):
+        return
+
+    saved_subtitle_paths = []
+    detected_encodings = []
+    total_chars = 0
+    for subtitle_file in subtitle_files:
+        safe_filename = os.path.basename(subtitle_file.name)
+        decoded = decode_subtitle_bytes(subtitle_file.getvalue())
+        script_content = decoded.text
+        detected_encoding = decoded.encoding
+
+        if not script_content:
+            st.error(tr("Unable to read subtitle file, please check file encoding"))
+            st.stop()
+
+        if len(script_content.strip()) < 10:
+            st.warning(tr("Subtitle file content appears to be empty, please check the file"))
+
+        script_file_path = _unique_file_path(utils.subtitle_dir(), safe_filename)
+        with open(script_file_path, "w", encoding='utf-8') as f:
+            f.write(script_content)
+
+        saved_subtitle_paths.append(script_file_path)
+        detected_encodings.append(detected_encoding.upper())
+        total_chars += len(script_content)
+
+    if len(saved_subtitle_paths) == 1:
+        st.success(
+            f"{tr('瀛楀箷涓婁紶鎴愬姛')} "
+            f"({tr('Encoding')}: {detected_encodings[0]}, "
+            f"{tr('Size')}: {total_chars} {tr('Characters')})"
+        )
+    else:
+        st.success(
+            tr("Subtitle upload succeeded for multiple files").format(
+                count=len(saved_subtitle_paths),
+                files=_format_file_list_for_display(saved_subtitle_paths),
+            )
+        )
+
+    _set_subtitle_state(saved_subtitle_paths)
+    st.session_state['uploaded_subtitle_signature'] = subtitle_signature
+
+
 def render_subtitle_upload(tr):
     """上传并保存用户提供的 SRT 字幕文件。"""
     subtitle_dir_label = utils.subtitle_dir().replace(config.root_dir, ".")
@@ -941,22 +1098,36 @@ def render_subtitle_upload(tr):
         f"**{tr('上传字幕文件')}**  "
         f":gray[{tr('Transcribed subtitles storage hint').format(path=subtitle_dir_label)}]"
     )
-    subtitle_file = st.file_uploader(
+    subtitle_files = st.file_uploader(
         tr("上传字幕文件"),
         type=["srt"],
-        accept_multiple_files=False,
+        accept_multiple_files=True,
         key="subtitle_file_uploader",  # 添加唯一key
         label_visibility="collapsed",
     )
     
     # 显示当前已上传的字幕文件路径
-    if 'subtitle_path' in st.session_state and st.session_state['subtitle_path']:
-        st.info(tr("Uploaded subtitle").format(file=os.path.basename(st.session_state['subtitle_path'])))
+    current_subtitle_paths = _selected_subtitle_paths()
+    if current_subtitle_paths:
+        if len(current_subtitle_paths) == 1:
+            st.info(tr("Uploaded subtitle").format(file=os.path.basename(current_subtitle_paths[0])))
+        else:
+            st.info(
+                tr("Uploaded subtitles").format(
+                    count=len(current_subtitle_paths),
+                    files=_format_file_list_for_display(current_subtitle_paths),
+                )
+            )
         if st.button(tr("清除已上传字幕")):
             _set_subtitle_state([])
             st.rerun()
     
     # 只有当有文件上传且尚未处理时才执行处理逻辑
+    if subtitle_files:
+        _save_uploaded_subtitle_files(tr, subtitle_files)
+        return
+
+    subtitle_file = None
     if subtitle_file is not None and not st.session_state['subtitle_file_processed']:
         try:
             # 清理文件名，防止路径污染和路径遍历攻击
@@ -1575,6 +1746,9 @@ def render_script_buttons(tr, params):
         language_option_key = _summary_state_key(summary_config, "narration_language_option")
         custom_language_key = _summary_state_key(summary_config, "custom_narration_language")
         narration_copy_key = _summary_state_key(summary_config, "narration_copy")
+        narration_scope_key = _summary_state_key(summary_config, "narration_scope")
+        episode_target_chars_key = _summary_state_key(summary_config, "episode_target_chars")
+        episode_plot_analysis_key = _summary_state_key(summary_config, "episode_plot_analysis")
 
         type_options = [code for code, _ in summary_config["type_options"]]
         if st.session_state.get(type_option_key) not in type_options:
@@ -1637,6 +1811,43 @@ def render_script_buttons(tr, params):
                     placeholder=tr("例如：意大利语（意大利）"),
                 )
 
+        if script_path == MODE_FILM_SUMMARY:
+            if st.session_state.get(narration_scope_key) not in {NARRATION_SCOPE_OVERALL, NARRATION_SCOPE_EPISODE}:
+                st.session_state[narration_scope_key] = NARRATION_SCOPE_OVERALL
+            if not st.session_state.get(episode_target_chars_key):
+                st.session_state[episode_target_chars_key] = 1200
+            if episode_plot_analysis_key not in st.session_state:
+                st.session_state[episode_plot_analysis_key] = True
+
+            scope_cols = st.columns([1.2, 1, 1], vertical_alignment="bottom")
+            with scope_cols[0]:
+                st.radio(
+                    tr("Narration Scope"),
+                    options=[NARRATION_SCOPE_OVERALL, NARRATION_SCOPE_EPISODE],
+                    format_func=lambda scope: tr(
+                        "Overall Narration" if scope == NARRATION_SCOPE_OVERALL else "Episode Narration"
+                    ),
+                    key=narration_scope_key,
+                    horizontal=True,
+                )
+            with scope_cols[1]:
+                st.number_input(
+                    tr("Episode Target Chars"),
+                    min_value=600,
+                    max_value=2500,
+                    step=100,
+                    key=episode_target_chars_key,
+                    disabled=st.session_state.get(narration_scope_key) != NARRATION_SCOPE_EPISODE,
+                    help=tr("Episode Target Chars Help"),
+                )
+            with scope_cols[2]:
+                st.checkbox(
+                    tr("Episode Plot Analysis"),
+                    key=episode_plot_analysis_key,
+                    disabled=st.session_state.get(narration_scope_key) != NARRATION_SCOPE_EPISODE,
+                    help=tr("Episode Plot Analysis Help"),
+                )
+
         action_cols = st.columns([1, 1], vertical_alignment="bottom")
         with action_cols[0]:
             narration_copy_clicked = st.button(
@@ -1668,10 +1879,16 @@ def render_script_buttons(tr, params):
         plot_source_key = _summary_state_key(summary_config, "plot_analysis_subtitle_path")
         plot_signature_key = _summary_state_key(summary_config, "plot_analysis_signature")
         web_search_key = _summary_state_key(summary_config, "web_search_enabled")
+        narration_scope_key = _summary_state_key(summary_config, "narration_scope")
+        episode_target_chars_key = _summary_state_key(summary_config, "episode_target_chars")
+        episode_plot_analysis_key = _summary_state_key(summary_config, "episode_plot_analysis")
 
         narration_language = _resolve_summary_narration_language(summary_config)
         drama_genre = _resolve_summary_type(summary_config)
         original_sound_ratio = int(st.session_state.get(original_sound_ratio_key, 30))
+        narration_scope = st.session_state.get(narration_scope_key, NARRATION_SCOPE_OVERALL)
+        episode_target_chars = int(st.session_state.get(episode_target_chars_key, 1200) or 1200)
+        episode_plot_analysis = bool(st.session_state.get(episode_plot_analysis_key, True))
         if (
             st.session_state.get(type_option_key) == "custom"
             and not str(st.session_state.get(custom_type_key, '') or '').strip()
@@ -1722,6 +1939,9 @@ def render_script_buttons(tr, params):
                     search_keywords=summary_config["search_keywords"],
                     empty_title_message_key=summary_config["empty_title_message_key"],
                     web_search_context_description=summary_config["web_search_context_description"],
+                    narration_scope=narration_scope,
+                    episode_target_chars=episode_target_chars,
+                    episode_plot_analysis=episode_plot_analysis,
             )
             if copy_result:
                 st.session_state[narration_copy_key] = copy_result["narration_copy"]
@@ -1750,6 +1970,7 @@ def render_script_buttons(tr, params):
                 search_keywords=summary_config["search_keywords"],
                 empty_title_message_key=summary_config["empty_title_message_key"],
                 web_search_context_description=summary_config["web_search_context_description"],
+                narration_scope=narration_scope,
             )
 
     if script_path in SUMMARY_SCRIPT_MODES:
@@ -1892,6 +2113,14 @@ def save_script_with_validation(tr, video_clip_json_details):
                 st.code(json.dumps(example_script, ensure_ascii=False, indent=2), language='json')
                 st.stop()
 
+            script_items = json.loads(video_clip_json_details)
+            source_errors = _validate_script_video_sources(script_items, _selected_video_paths())
+            if source_errors:
+                st.error(f"**{tr('Script format validation failed')}**")
+                for error in source_errors:
+                    st.error(error)
+                st.stop()
+
         except Exception as e:
             st.error(f"{tr('Script format validation error')}: {str(e)}")
             st.stop()
@@ -1941,5 +2170,6 @@ def get_script_params():
         'original_subtitle_path': subtitle_paths[0] if subtitle_paths else '',
         'original_subtitle_paths': subtitle_paths,
         'video_name': st.session_state.get('video_name', ''),
-        'video_plot': st.session_state.get('video_plot', '')
+        'video_plot': st.session_state.get('video_plot', ''),
+        'cover_name': st.session_state.get('cover_name', ''),
     }

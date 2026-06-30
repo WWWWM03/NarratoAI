@@ -39,6 +39,14 @@ def _run_async_safely(coro_func, *args, **kwargs):
         try:
             return loop.run_until_complete(coro_func(*args, **kwargs))
         finally:
+            try:
+                pending_tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                if pending_tasks:
+                    loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception as cleanup_error:
+                logger.debug(f"异步事件循环清理失败: {cleanup_error}")
             loop.close()
             asyncio.set_event_loop(None)
 

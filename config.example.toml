@@ -225,8 +225,42 @@
     pitch = 1.0
     silence_duration = 0.125
 
+[voxcpm2]
+    # VoxCPM2 local voice cloning through the running Gradio HTTP service.
+    # This should be the base URL of the VoxCPM2 WebUI / Gradio server.
+    api_url = "http://127.0.0.1:8808"
+
+    # Default reference audio. The selector reuses the IndexTTS-1.5 resource list.
+    reference_audio_source = "resource"
+    reference_audio = ""
+
+    # Enable this when the reference audio transcript is known.
+    use_prompt_text = false
+
+    # Exact transcript of the reference audio.
+    prompt_text = ""
+
+    # Optional style/control instruction.
+    control_instruction = ""
+
+    # Generation parameters passed to /generate.
+    cfg_value = 2.0            # CFG guidance scale, recommended 1.0-3.0
+    inference_timesteps = 10   # DIT inference steps, recommended 4-30
+    normalize = false          # Enable text normalization
+    denoise = false            # Enable reference-audio denoise
+
+    # Sentence-level synthesis and audio cleanup.
+    # Text is split only at full sentence boundaries for VoxCPM2 generation.
+    sentence_gap_ms = 180
+    trim_silence = true
+    trim_padding_ms = 60
+    trim_silence_threshold_offset = 18
+
+    # Request timeout in seconds. Keep this high for model loading and inference.
+    timeout = 300
+
 [ui]
-    # TTS引擎选择 (indextts, indextts2, omnivoice, edge_tts, qwen3_tts, tencent_tts, doubaotts, azure_speech)
+    # TTS引擎选择 (indextts, indextts2, omnivoice, voxcpm2, edge_tts, qwen3_tts, tencent_tts, doubaotts, azure_speech)
     tts_engine = "indextts"
 
     # Edge TTS 配置
@@ -244,6 +278,15 @@
     # 豆包语音 TTS 配置
     doubaotts_voice_type = "BV700_V2_streaming"
     doubaotts_rate = 1.0
+
+    # tmdb-image 封面生成配置
+    # 需要先启动：tmdb-image serve --port 8080
+    cover_enabled = false
+    cover_api_url = "http://127.0.0.1:8080"
+    cover_name = ""
+    cover_platforms = []
+    cover_style_hint = "短视频爆款封面，强冲突，高点击率"
+    cover_use_llm = true
 
     # 字幕遮罩配置：用于在烧录新字幕前遮盖原视频自带字幕
     subtitle_mask_enabled = false

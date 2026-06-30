@@ -21,10 +21,10 @@ class AudioVolumeDefaults:
     TTS_VOLUME = 1.0
 
     # 原声音量默认值 - 提高原声音量以平衡TTS
-    ORIGINAL_VOLUME = 1.2
+    ORIGINAL_VOLUME = 0.9
 
     # 背景音乐音量默认值
-    BGM_VOLUME = 0.3
+    BGM_VOLUME = 0.2
 
     # 音量范围
     MIN_VOLUME = 0.0
@@ -123,7 +123,7 @@ class VideoParams(BaseModel):
     video_subject: str
     video_script: str = ""  # 用于生成视频的脚本
     video_terms: Optional[Union[str, list]] = None  # 用于生成视频的关键词
-    video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
+    video_aspect: Optional[VideoAspect] = VideoAspect.landscape.value
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_clip_duration: Optional[int] = 5
     video_count: Optional[int] = 1
@@ -167,7 +167,7 @@ class VideoClipParams(BaseModel):
     video_origin_paths: Optional[List[str]] = Field(default=[], description="原视频路径列表")
     original_subtitle_path: Optional[str] = Field(default="", description="原视频字幕路径")
     original_subtitle_paths: Optional[List[str]] = Field(default=[], description="原视频字幕路径列表")
-    video_aspect: Optional[VideoAspect] = Field(default=VideoAspect.portrait.value, description="视频比例")
+    video_aspect: Optional[VideoAspect] = Field(default=VideoAspect.landscape.value, description="视频比例")
     video_language: Optional[str] = Field(default="zh-CN", description="视频语言")
 
     # video_clip_duration: Optional[int] = 5      # 视频片段时长
@@ -222,6 +222,12 @@ class VideoClipParams(BaseModel):
     original_volume: Optional[float] = Field(default=AudioVolumeDefaults.ORIGINAL_VOLUME, description="视频原声音量")
     bgm_volume: Optional[float] = Field(default=AudioVolumeDefaults.BGM_VOLUME, description="背景音乐音量")
     draft_name: Optional[str] = Field(default="", description="剪映草稿名称")
+    cover_enabled: Optional[bool] = Field(default=False, description="是否生成并插入封面")
+    cover_api_url: Optional[str] = Field(default="", description="tmdb-image API 地址")
+    cover_name: Optional[str] = Field(default="", description="用于生成封面的影视名称")
+    cover_platforms: Optional[List[str]] = Field(default=None, description="tmdb-image 封面平台")
+    cover_style_hint: Optional[str] = Field(default="", description="tmdb-image 封面风格提示")
+    cover_use_llm: Optional[bool] = Field(default=True, description="tmdb-image 是否使用 LLM")
 
 
 

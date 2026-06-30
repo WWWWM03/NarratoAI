@@ -19,6 +19,8 @@ from app.services import (
     update_script,
     generate_video,
     script_subtitle,
+    subtitle_resolver,
+    cover_service,
 )
 from app.services import state as sm
 from app.utils import utils
@@ -70,29 +72,15 @@ def _get_auto_transcription_backend(params: VideoClipParams) -> str:
     return backend
 
 
-def _get_original_subtitle_paths(params: VideoClipParams) -> list[str]:
-    subtitle_paths = getattr(params, "original_subtitle_paths", []) or []
-    if isinstance(subtitle_paths, str):
-        subtitle_paths = [subtitle_paths]
-
-    normalized_paths = []
-    seen = set()
-    for subtitle_path in subtitle_paths:
-        if not isinstance(subtitle_path, str):
-            continue
-        subtitle_path = subtitle_path.strip()
-        if subtitle_path and subtitle_path not in seen:
-            normalized_paths.append(subtitle_path)
-            seen.add(subtitle_path)
-
-    single_subtitle_path = str(getattr(params, "original_subtitle_path", "") or "").strip()
-    if single_subtitle_path and single_subtitle_path not in seen:
-        normalized_paths.insert(0, single_subtitle_path)
-
-    if not normalized_paths:
-        normalized_paths = _find_original_subtitle_paths_for_videos(_get_video_origin_paths(params))
-
-    return normalized_paths
+def _get_original_subtitle_paths(
+    params: VideoClipParams,
+    list_script: list[dict] | None = None,
+) -> list[str]:
+    return subtitle_resolver.get_original_subtitle_paths(
+        params,
+        list_script=list_script,
+        video_paths=_get_video_origin_paths(params),
+    )
 
 
 def _get_video_origin_paths(params: VideoClipParams) -> list[str]:
@@ -130,6 +118,8 @@ def _video_stem_candidates(video_path: str) -> list[str]:
 
 
 def _find_original_subtitle_paths_for_videos(video_paths: list[str]) -> list[str]:
+    return subtitle_resolver.find_original_subtitle_paths_for_videos(video_paths)
+
     subtitle_dir = utils.subtitle_dir()
     if not path.isdir(subtitle_dir):
         return []
@@ -179,7 +169,7 @@ def _create_programmatic_subtitle_file(
     if not getattr(params, "subtitle_enabled", True):
         return ""
 
-    original_subtitle_paths = _get_original_subtitle_paths(params)
+    original_subtitle_paths = _get_original_subtitle_paths(params, list_script)
     logger.info(f"程序化字幕使用原片字幕路径: {original_subtitle_paths or '未提供'}")
     return script_subtitle.create_script_subtitle_file(
         task_id=task_id,
@@ -187,6 +177,30 @@ def _create_programmatic_subtitle_file(
         original_subtitle_paths=original_subtitle_paths,
         video_origin_paths=_get_video_origin_paths(params),
     )
+
+
+def _attach_tts_subtitle_chunks(list_script: list[dict], tts_results: list[dict]) -> None:
+    chunks_by_key = {}
+    for tts_result in tts_results or []:
+        chunks = tts_result.get("subtitle_chunks") or []
+        if not chunks:
+            continue
+        item_id = tts_result.get("_id")
+        timestamp = tts_result.get("timestamp")
+        if item_id is not None:
+            chunks_by_key[item_id] = chunks
+        if timestamp:
+            chunks_by_key[timestamp] = chunks
+
+    if not chunks_by_key:
+        return
+
+    for item in list_script:
+        item_id = item.get("_id")
+        timestamp = item.get("timestamp")
+        chunks = chunks_by_key.get(item_id) or chunks_by_key.get(timestamp)
+        if chunks:
+            item["subtitle_chunks"] = chunks
 
 
 def _build_subtitle_mask_options(params: VideoClipParams, enabled=None) -> dict:
@@ -305,6 +319,19 @@ def _merge_auto_transcribed_subtitles(
     )
 
 
+def _apply_cover_to_final_video(task_id: str, output_video_path: str, params: VideoClipParams) -> str:
+    cover_path = cover_service.generate_cover(task_id, params)
+    if not cover_path:
+        return ""
+
+    cover_service.prepend_cover_first_frame(
+        video_path=output_video_path,
+        cover_image_path=cover_path,
+        threads=int(getattr(params, "n_threads", 4) or 4),
+    )
+    return cover_path
+
+
 def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: dict = None):
     """
     后台任务（统一视频裁剪处理）- 优化版本
@@ -409,6 +436,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
         tts_result['_id']: tts_result['subtitle_file'] for tts_result in tts_results
     }
     new_script_list = update_script.update_script_timestamps(list_script, video_clip_result, tts_clip_result, subclip_clip_result)
+    _attach_tts_subtitle_chunks(new_script_list, tts_results)
 
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
 
@@ -586,6 +614,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
             params=params,
         )
 
+    cover_path = _apply_cover_to_final_video(task_id, output_video_path, params)
     final_video_paths.append(output_video_path)
     combined_video_paths.append(combined_video_path)
 
@@ -597,6 +626,8 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     }
     if auto_subtitle_path:
         kwargs["subtitles"] = [auto_subtitle_path]
+    if cover_path:
+        kwargs["covers"] = [cover_path]
     sm.state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs)
     return kwargs
 
@@ -711,6 +742,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
         tts_result['_id']: tts_result['subtitle_file'] for tts_result in tts_results
     }
     new_script_list = update_script.update_script_timestamps(list_script, video_clip_result, tts_clip_result, subclip_clip_result)
+    _attach_tts_subtitle_chunks(new_script_list, tts_results)
 
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
 
@@ -941,6 +973,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
             params=params,
         )
 
+    cover_path = _apply_cover_to_final_video(task_id, output_video_path, params)
     final_video_paths.append(output_video_path)
     combined_video_paths.append(combined_video_path)
 
@@ -952,6 +985,8 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     }
     if auto_subtitle_path:
         kwargs["subtitles"] = [auto_subtitle_path]
+    if cover_path:
+        kwargs["covers"] = [cover_path]
     _update_video_generation_task(
         task_id,
         progress=100,

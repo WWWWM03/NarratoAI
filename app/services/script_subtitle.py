@@ -12,8 +12,14 @@ from app.utils import utils
 
 DEFAULT_SUBTITLE_OST_TYPES = (0, 2)
 DEFAULT_ORIGINAL_SUBTITLE_OST_TYPES = (1,)
-DEFAULT_MAX_CHARS_PER_SUBTITLE = 12
-SENTENCE_PART_RE = re.compile(r"[^。！？!?；;，,、\n]+[。！？!?；;，,、]?")
+DEFAULT_MAX_CHARS_PER_SUBTITLE = 18  # 单行字幕建议 18-20，过小会过度切句
+HARD_BREAK_RE = re.compile(r"[。！？!?；;]+")
+SOFT_BREAK_RE = re.compile(r"[，,、：:]+|(?:[—―]+|-{2,})|(?=[“「『])")
+SEMANTIC_BREAK_RE = re.compile(
+    r"(?<=[里中上前后时])"
+    r"(?=(?:爆发|发现|开始|继续|突然|终于|已经|正在|把|被|让|给|用|从|对|向|说|喊|告诉|"
+    r"变成|完成|成为|教|带|跑|站|坐|走|拿|看|听|问|追问))"
+)
 SubtitleEntry = Tuple[float, float, str]
 
 
@@ -33,37 +39,70 @@ def clean_subtitle_text(text: str) -> str:
     return _normalize_text(_remove_punctuation(text))
 
 
-def split_narration(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) -> List[str]:
-    """Split narration into readable subtitle chunks."""
+def _split_by_breaks(text: str, break_re: re.Pattern) -> List[str]:
+    parts: List[str] = []
+    start = 0
+    for match in break_re.finditer(text):
+        if match.start() == match.end():
+            if match.start() > start:
+                parts.append(text[start:match.start()].strip())
+                start = match.start()
+            continue
+
+        end = match.end()
+        if end > start:
+            parts.append(text[start:end].strip())
+            start = end
+
+    if start < len(text):
+        parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
+def _split_long_parts_on_semantics(parts: List[str], max_chars: int) -> List[str]:
+    refined: List[str] = []
+    for part in parts:
+        if len(part) > max_chars:
+            semantic_parts = _split_by_breaks(part, SEMANTIC_BREAK_RE)
+            if len(semantic_parts) > 1:
+                refined.extend(semantic_parts)
+                continue
+        refined.append(part)
+    return refined
+
+
+def _split_narration_chunks(
+    text: str,
+    max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE,
+    *,
+    clean_text: bool,
+) -> List[str]:
     text = _normalize_text(text)
     if not text:
         return []
 
     max_chars = max(1, int(max_chars or DEFAULT_MAX_CHARS_PER_SUBTITLE))
-    parts = [match.group(0).strip() for match in SENTENCE_PART_RE.finditer(text)]
+    parts = _split_by_breaks(text, re.compile(f"{HARD_BREAK_RE.pattern}|{SOFT_BREAK_RE.pattern}"))
+    parts = _split_long_parts_on_semantics(parts, max_chars)
     if not parts:
         parts = [text]
 
     chunks = []
     current = ""
 
-    def flush_long_part(part: str) -> str:
-        while len(part) > max_chars:
-            chunks.append(part[:max_chars].strip())
-            part = part[max_chars:].strip()
-        return part
-
     for part in parts:
         if not part:
             continue
 
+        # 超长句段只按原始自然边界落块，不做字数硬切。
         if len(part) > max_chars:
             if current:
                 chunks.append(current.strip())
                 current = ""
-            current = flush_long_part(part)
+            chunks.append(part.strip())
             continue
 
+        # max_chars 只决定相邻自然片段是否合并，不能切开自然片段。
         candidate = f"{current}{part}" if current else part
         if len(candidate) <= max_chars:
             current = candidate
@@ -75,7 +114,43 @@ def split_narration(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) 
     if current:
         chunks.append(current.strip())
 
-    return [cleaned for chunk in chunks if (cleaned := clean_subtitle_text(chunk))]
+    if clean_text:
+        return [cleaned for chunk in chunks if (cleaned := clean_subtitle_text(chunk))]
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def split_narration(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) -> List[str]:
+    """将解说文案按源标点切分为可读字幕块，不按纯字数硬切。"""
+    return _split_narration_chunks(text, max_chars=max_chars, clean_text=True)
+
+
+def split_narration_for_tts(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) -> List[str]:
+    """Split narration into TTS chunks on natural punctuation, preserving punctuation."""
+    text = _normalize_text(text)
+    if not text:
+        return []
+
+    sentence_parts = _split_by_breaks(text, HARD_BREAK_RE)
+    if not sentence_parts:
+        sentence_parts = [text]
+
+    max_chars = max(1, int(max_chars or DEFAULT_MAX_CHARS_PER_SUBTITLE))
+    chunks: List[str] = []
+    for sentence in sentence_parts:
+        soft_parts = _split_by_breaks(sentence, SOFT_BREAK_RE) or [sentence]
+        soft_parts = _split_long_parts_on_semantics(soft_parts, max_chars)
+
+        current = ""
+        for part in soft_parts:
+            candidate = f"{current}{part}" if current else part
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = part
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+    return chunks
 
 
 def parse_srt_like_time(time_text: str) -> float:
@@ -238,6 +313,38 @@ def _build_narration_subtitle_entries(
         if ost not in include_ost_set:
             continue
 
+        subtitle_chunks = item.get("subtitle_chunks") or []
+        if subtitle_chunks:
+            start, end = time_range
+            segment_duration = end - start
+            if segment_duration <= 0:
+                continue
+
+            cursor = start
+            valid_chunks = []
+            for chunk in subtitle_chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                text = clean_subtitle_text(chunk.get("text", ""))
+                duration = float(chunk.get("duration", 0.0) or 0.0)
+                if text and duration > 0:
+                    valid_chunks.append((text, duration))
+
+            total_chunk_duration = sum(duration for _, duration in valid_chunks)
+            if total_chunk_duration <= 0:
+                continue
+
+            time_scale = segment_duration / total_chunk_duration
+            for chunk_index, (chunk_text, chunk_duration) in enumerate(valid_chunks):
+                if chunk_index == len(valid_chunks) - 1:
+                    chunk_end = end
+                else:
+                    chunk_end = cursor + chunk_duration * time_scale
+
+                entries.append((cursor, chunk_end, chunk_text))
+                cursor = chunk_end
+            continue
+
         chunks = split_narration(item.get("narration", ""), max_chars=max_chars)
         if not chunks:
             continue
@@ -247,11 +354,17 @@ def _build_narration_subtitle_entries(
         if segment_duration <= 0:
             continue
 
-        chunk_duration = segment_duration / len(chunks)
+        # 按各字幕块字符数比例分配时长（长句给更多时间），而非简单按块数等分
+        chunk_lengths = [max(1, len(chunk)) for chunk in chunks]
+        total_length = sum(chunk_lengths)
+        cursor = start
         for chunk_index, chunk in enumerate(chunks):
-            chunk_start = start + chunk_duration * chunk_index
-            chunk_end = end if chunk_index == len(chunks) - 1 else start + chunk_duration * (chunk_index + 1)
-            entries.append((chunk_start, chunk_end, chunk))
+            if chunk_index == len(chunks) - 1:
+                chunk_end = end  # 末块对齐段尾，消除累计浮点误差
+            else:
+                chunk_end = cursor + segment_duration * (chunk_lengths[chunk_index] / total_length)
+            entries.append((cursor, chunk_end, chunk))
+            cursor = chunk_end
 
     return entries
 

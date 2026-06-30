@@ -8,9 +8,10 @@ import edge_tts
 import asyncio
 import requests
 import uuid
+import tempfile
 from functools import lru_cache
 from loguru import logger
-from typing import List, Union, Tuple
+from typing import List, Union, Tuple, Any
 from datetime import datetime
 from xml.sax.saxutils import unescape
 from edge_tts import submaker, SubMaker
@@ -24,8 +25,12 @@ except ImportError:
     logger.warning("moviepy 未安装，将使用估算方法计算音频时长")
 import time
 from urllib.parse import urljoin
+from gradio_client import Client, handle_file
+from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 
 from app.config import config
+from app.services import script_subtitle
 from app.utils import utils
 
 
@@ -1304,7 +1309,11 @@ def tts(
     if tts_engine == config.OMNIVOICE_ENGINE:
         logger.info("分发到 OmniVoice")
         return omnivoice_tts(text, voice_name, voice_file, speed=voice_rate)
-    
+
+    if tts_engine == config.VOXCPM2_ENGINE:
+        logger.info("分发到 VoxCPM2")
+        return voxcpm2_tts(text, voice_name, voice_file, speed=voice_rate)
+
     if tts_engine == "doubaotts":
         logger.info("分发到豆包语音 TTS")
         return doubaotts_tts(text, voice_name, voice_file, speed=voice_rate)
@@ -1774,6 +1783,24 @@ def get_audio_duration(sub_maker: submaker.SubMaker):
     return sub_maker.offset[-1][1] / 10000000
 
 
+def _safe_tts_filename_part(value) -> str:
+    text = str(value or "").strip().replace(":", "_")
+    text = re.sub(r"[^0-9A-Za-z_\-,.]+", "_", text)
+    return text.strip("_")
+
+
+def get_tts_cache_stem(item: dict) -> str:
+    timestamp = _safe_tts_filename_part(item.get("timestamp", ""))
+    item_id = _safe_tts_filename_part(item.get("_id", ""))
+    if item_id:
+        return f"audio_{item_id}_{timestamp}"
+    return f"audio_{timestamp}"
+
+
+def get_legacy_tts_cache_stem(item: dict) -> str:
+    return f"audio_{_safe_tts_filename_part(item.get('timestamp', ''))}"
+
+
 def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: float, voice_pitch: float, tts_engine: str = "azure"):
     """
     根据JSON文件中的多段文本进行TTS转换
@@ -1793,14 +1820,16 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
         config.INDEXTTS_ENGINE,
         config.INDEXTTS2_ENGINE,
         config.OMNIVOICE_ENGINE,
+        config.VOXCPM2_ENGINE,
     ) else ".mp3"
 
     for item in list_script:
         if item['OST'] != 1:
             # 将时间戳中的冒号替换为下划线
             timestamp = item['timestamp'].replace(':', '_')
-            audio_file = os.path.join(output_dir, f"audio_{timestamp}{audio_extension}")
-            subtitle_file = os.path.join(output_dir, f"subtitle_{timestamp}.srt")
+            cache_stem = get_tts_cache_stem(item)
+            audio_file = os.path.join(output_dir, f"{cache_stem}{audio_extension}")
+            subtitle_file = os.path.join(output_dir, f"{cache_stem.replace('audio_', 'subtitle_', 1)}.srt")
 
             text = item['narration']
 
@@ -1819,11 +1848,12 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
                              f"或者使用其他 tts 引擎")
                 continue
             else:
+                subtitle_chunks = []
                 # SoulVoice、Qwen3、IndexTTS、OmniVoice、豆包语音 引擎不生成精确字幕文件
                 if (
                     is_soulvoice_voice(voice_name)
                     or is_qwen_engine(tts_engine)
-                    or tts_engine in (config.INDEXTTS_ENGINE, config.INDEXTTS2_ENGINE, config.OMNIVOICE_ENGINE)
+                    or tts_engine in (config.INDEXTTS_ENGINE, config.INDEXTTS2_ENGINE, config.OMNIVOICE_ENGINE, config.VOXCPM2_ENGINE)
                     or tts_engine == "doubaotts"
                 ):
                     # 获取实际音频文件的时长
@@ -1856,6 +1886,7 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
                             logger.warning(f"无法获取音频时长，使用文本估算: {duration:.2f}秒 (英文单词: {english_words}, 中文字符: {chinese_chars})")
                     # 不创建字幕文件
                     subtitle_file = ""
+                    subtitle_chunks = _build_narration_subtitle_chunks(text, duration)
                 else:
                     _, duration = create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
 
@@ -1866,6 +1897,7 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
                 "subtitle_file": subtitle_file,
                 "duration": duration,
                 "text": text,
+                "subtitle_chunks": subtitle_chunks,
             })
             logger.info(f"已生成音频文件: {audio_file}")
 
@@ -2277,6 +2309,17 @@ def parse_omnivoice_voice(voice_name: str) -> str:
     return voice_name
 
 
+def parse_voxcpm2_voice(voice_name: str) -> str:
+    """
+    解析 VoxCPM2 语音名称
+    支持格式：voxcpm2:reference_audio_path
+    返回参考音频文件路径
+    """
+    if isinstance(voice_name, str) and voice_name.startswith(config.VOXCPM2_VOICE_PREFIX):
+        return voice_name[len(config.VOXCPM2_VOICE_PREFIX):]
+    return voice_name
+
+
 def indextts_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.0) -> Union[SubMaker, None]:
     """
     使用 IndexTTS-1.5 API 进行零样本语音克隆
@@ -2651,4 +2694,334 @@ def omnivoice_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.
             time.sleep(2)
 
     logger.error("OmniVoice TTS 生成失败，已达到最大重试次数")
+    return None
+
+
+def _normalize_voxcpm2_api_url(api_url: str) -> str:
+    api_url = (api_url or "http://127.0.0.1:8808").strip()
+    if not api_url:
+        return "http://127.0.0.1:8808"
+    return api_url.rstrip("/")
+
+
+_VOXCPM2_SENTENCE_ENDINGS = set("。！？!?；;.…")
+_VOXCPM2_CLOSING_QUOTES = set("”’』」》）)]\"'")
+
+
+def _split_tts_full_sentences(text: str) -> List[str]:
+    """Split only on complete sentence boundaries, never on commas or short phrases."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+
+    sentences: List[str] = []
+    start = 0
+    i = 0
+    while i < len(text):
+        char = text[i]
+        is_decimal_period = (
+            char == "."
+            and i > 0
+            and i < len(text) - 1
+            and text[i - 1].isdigit()
+            and text[i + 1].isdigit()
+        )
+        if char in _VOXCPM2_SENTENCE_ENDINGS and not is_decimal_period:
+            end = i + 1
+            while end < len(text) and (
+                text[end] in _VOXCPM2_SENTENCE_ENDINGS
+                or text[end] in _VOXCPM2_CLOSING_QUOTES
+            ):
+                end += 1
+            sentence = text[start:end].strip()
+            if sentence:
+                sentences.append(sentence)
+            start = end
+            i = end
+            continue
+        i += 1
+
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+
+    return sentences or [text]
+
+
+def _audio_non_silent_bounds(audio: AudioSegment, silence_thresh_offset: float) -> tuple[int, int] | None:
+    if len(audio) <= 0 or audio.dBFS == float("-inf"):
+        return None
+
+    silence_thresh = audio.dBFS - float(silence_thresh_offset)
+    ranges = detect_nonsilent(
+        audio,
+        min_silence_len=80,
+        silence_thresh=silence_thresh,
+        seek_step=10,
+    )
+    if not ranges:
+        return None
+
+    return ranges[0][0], ranges[-1][1]
+
+
+def _trim_audio_edges(
+    audio: AudioSegment,
+    *,
+    enabled: bool,
+    padding_ms: int,
+    silence_thresh_offset: float,
+) -> AudioSegment:
+    if not enabled:
+        return audio
+
+    bounds = _audio_non_silent_bounds(audio, silence_thresh_offset)
+    if not bounds:
+        return audio
+
+    start, end = bounds
+    start = max(0, start - max(0, padding_ms))
+    end = min(len(audio), end + max(0, padding_ms))
+    if end <= start:
+        return audio
+    return audio[start:end]
+
+
+def _extract_gradio_audio_path(result: Any) -> str:
+    if isinstance(result, str):
+        return result if os.path.isfile(result) else ""
+    if isinstance(result, dict):
+        for key in ("path", "name"):
+            value = result.get(key)
+            if isinstance(value, str) and os.path.isfile(value):
+                return value
+        return ""
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            path = _extract_gradio_audio_path(item)
+            if path:
+                return path
+    return ""
+
+
+def _predict_voxcpm2_audio(
+    client: Client,
+    *,
+    api_url: str,
+    text: str,
+    control_instruction: str,
+    reference_audio_path: str,
+    use_prompt_text: bool,
+    prompt_text: str,
+    cfg_value,
+    normalize: bool,
+    denoise: bool,
+    inference_timesteps,
+    output_file: str,
+) -> bool:
+    result = client.predict(
+        text=text.strip(),
+        control_instruction=control_instruction,
+        ref_wav=handle_file(reference_audio_path),
+        use_prompt_text=use_prompt_text,
+        prompt_text_value=prompt_text if use_prompt_text else "",
+        cfg_value=float(cfg_value),
+        do_normalize=normalize,
+        denoise=denoise,
+        dit_steps=float(inference_timesteps),
+        api_name="/generate",
+    )
+
+    generated_audio_path = _extract_gradio_audio_path(result)
+    if generated_audio_path:
+        with open(generated_audio_path, "rb") as src, open(output_file, "wb") as dst:
+            dst.write(src.read())
+
+    if os.path.isfile(output_file) and os.path.getsize(output_file) > 0:
+        return True
+
+    logger.error(
+        f"VoxCPM2 API did not generate a valid audio file; "
+        f"api={api_url}/generate result={str(result)[:500]}"
+    )
+    return False
+
+
+def _build_voxcpm2_sub_maker_from_chunks(
+    chunks: List[tuple[str, float]],
+) -> SubMaker:
+    sub_maker = new_sub_maker()
+    cursor_ms = 0
+    for text, duration_ms in chunks:
+        duration_ms = max(1, int(round(duration_ms)))
+        start = cursor_ms
+        end = cursor_ms + duration_ms
+        add_subtitle_event(sub_maker, start * 10000, end * 10000, text)
+        cursor_ms = end
+    return sub_maker
+
+
+def _build_narration_subtitle_chunks(text: str, duration: float, max_chars: int = 18) -> List[dict]:
+    """Create natural display chunks for engines that do not return word timings."""
+    chunks = script_subtitle.split_narration(text, max_chars=max_chars)
+    if not chunks:
+        return []
+
+    duration = max(0.0, float(duration or 0.0))
+    if duration <= 0:
+        return [{"text": chunk, "duration": max(0.4, len(chunk) / 6.0)} for chunk in chunks]
+
+    weights = [max(1, len(chunk)) for chunk in chunks]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return []
+
+    subtitle_chunks = []
+    allocated = 0.0
+    for index, chunk in enumerate(chunks):
+        if index == len(chunks) - 1:
+            chunk_duration = max(0.001, duration - allocated)
+        else:
+            chunk_duration = duration * (weights[index] / total_weight)
+            allocated += chunk_duration
+        subtitle_chunks.append({"text": chunk, "duration": chunk_duration})
+
+    return subtitle_chunks
+
+
+def voxcpm2_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.0) -> Union[SubMaker, None]:
+    """Generate speech with the running VoxCPM2 Gradio API."""
+    voxcpm2_config = getattr(config, "voxcpm2", {}) or {}
+    api_url = _normalize_voxcpm2_api_url(
+        voxcpm2_config.get("api_url", "http://127.0.0.1:8808")
+    )
+
+    reference_audio_path = parse_voxcpm2_voice(voice_name)
+    if not reference_audio_path or not os.path.isfile(reference_audio_path):
+        reference_audio_path = parse_voxcpm2_voice(
+            voxcpm2_config.get("reference_audio", "") or ""
+        )
+    if not reference_audio_path or not os.path.isfile(reference_audio_path):
+        logger.error(f"VoxCPM2 reference audio file does not exist: {reference_audio_path}")
+        return None
+
+    prompt_text = (voxcpm2_config.get("prompt_text", "") or "").strip()
+    use_prompt_text = bool(
+        voxcpm2_config.get("use_prompt_text", bool(prompt_text))
+    )
+    control_instruction = (
+        voxcpm2_config.get("control_instruction", "") or ""
+    ).strip()
+    cfg_value = voxcpm2_config.get("cfg_value", 2.0)
+    inference_timesteps = voxcpm2_config.get(
+        "inference_timesteps", voxcpm2_config.get("dit_steps", 10)
+    )
+    normalize = bool(voxcpm2_config.get("normalize", False))
+    denoise = bool(voxcpm2_config.get("denoise", False))
+    timeout = int(voxcpm2_config.get("timeout", 300) or 300)
+    sentence_gap_ms = int(voxcpm2_config.get("sentence_gap_ms", 180) or 180)
+    trim_silence = bool(voxcpm2_config.get("trim_silence", True))
+    trim_padding_ms = int(voxcpm2_config.get("trim_padding_ms", 60) or 60)
+    trim_threshold_offset = float(voxcpm2_config.get("trim_silence_threshold_offset", 18) or 18)
+
+    if speed and float(speed) != 1.0:
+        logger.debug("VoxCPM2 API does not expose speed control; speed was ignored")
+
+    output_dir = os.path.dirname(voice_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    tts_sentences = _split_tts_full_sentences(text)
+    if not tts_sentences:
+        logger.error("VoxCPM2 text is empty")
+        return None
+
+    for attempt in range(3):
+        try:
+            logger.info(
+                f"Calling VoxCPM2 API attempt {attempt + 1}: {api_url}/generate "
+                f"(use_prompt_text={use_prompt_text}, sentences={len(tts_sentences)}) -> {voice_file}"
+            )
+            client = Client(api_url, httpx_kwargs={"timeout": timeout})
+
+            generated_chunks: List[tuple[str, str]] = []
+            with tempfile.TemporaryDirectory(prefix="voxcpm2_") as temp_dir:
+                for sentence_index, sentence in enumerate(tts_sentences, start=1):
+                    chunk_file = os.path.join(temp_dir, f"sentence_{sentence_index}.wav")
+                    if not _predict_voxcpm2_audio(
+                        client,
+                        api_url=api_url,
+                        text=sentence,
+                        control_instruction=control_instruction,
+                        reference_audio_path=reference_audio_path,
+                        use_prompt_text=use_prompt_text,
+                        prompt_text=prompt_text,
+                        cfg_value=cfg_value,
+                        normalize=normalize,
+                        denoise=denoise,
+                        inference_timesteps=inference_timesteps,
+                        output_file=chunk_file,
+                    ):
+                        generated_chunks = []
+                        break
+                    generated_chunks.append((sentence, chunk_file))
+
+                if len(generated_chunks) == 1:
+                    audio = AudioSegment.from_file(generated_chunks[0][1])
+                    audio = _trim_audio_edges(
+                        audio,
+                        enabled=trim_silence,
+                        padding_ms=trim_padding_ms,
+                        silence_thresh_offset=trim_threshold_offset,
+                    )
+                    audio.export(voice_file, format=os.path.splitext(voice_file)[1].lstrip(".") or "wav")
+                elif generated_chunks:
+                    combined = AudioSegment.empty()
+                    gap = AudioSegment.silent(duration=max(0, sentence_gap_ms))
+                    for sentence_index, (_, chunk_file) in enumerate(generated_chunks):
+                        audio = AudioSegment.from_file(chunk_file)
+                        audio = _trim_audio_edges(
+                            audio,
+                            enabled=trim_silence,
+                            padding_ms=trim_padding_ms,
+                            silence_thresh_offset=trim_threshold_offset,
+                        )
+                        if sentence_index > 0 and sentence_gap_ms > 0:
+                            combined += gap
+                        combined += audio
+                    combined.export(voice_file, format=os.path.splitext(voice_file)[1].lstrip(".") or "wav")
+
+            if os.path.isfile(voice_file) and os.path.getsize(voice_file) > 0:
+                logger.info(
+                    f"VoxCPM2 generated audio: {voice_file}, "
+                    f"size: {os.path.getsize(voice_file)} bytes"
+                )
+                duration = get_audio_duration_from_file(voice_file)
+                if duration > 0:
+                    subtitle_chunks = _build_narration_subtitle_chunks(text, duration)
+                    sentence_durations = []
+                    if subtitle_chunks:
+                        sentence_durations = [
+                            (chunk["text"], float(chunk["duration"]) * 1000)
+                            for chunk in subtitle_chunks
+                        ]
+                    if sentence_durations:
+                        sub_maker = _build_voxcpm2_sub_maker_from_chunks(sentence_durations)
+                    else:
+                        sub_maker = new_sub_maker()
+                        add_subtitle_event(sub_maker, 0, int(duration * 1000) * 10000, text)
+                else:
+                    sub_maker = new_sub_maker()
+                    duration_ms = max(1000, int(len(text) * 200))
+                    add_subtitle_event(sub_maker, 0, duration_ms * 10000, text)
+                return sub_maker
+        except requests.exceptions.Timeout:
+            logger.error(f"VoxCPM2 API timed out ({timeout}s) (attempt {attempt + 1}/3)")
+        except Exception as e:
+            logger.error(f"VoxCPM2 TTS error: {str(e)} (attempt {attempt + 1}/3)")
+
+        if attempt < 2:
+            time.sleep(2)
+
+    logger.error("VoxCPM2 TTS generation failed after maximum retries")
     return None

@@ -18,6 +18,9 @@ OMNIVOICE_DISPLAY_NAME = "OmniVoice"
 INDEXTTS_VOICE_PREFIX = f"{INDEXTTS_ENGINE}:"
 INDEXTTS2_VOICE_PREFIX = f"{INDEXTTS2_ENGINE}:"
 OMNIVOICE_VOICE_PREFIX = f"{OMNIVOICE_ENGINE}:"
+VOXCPM2_ENGINE = "voxcpm2"
+VOXCPM2_DISPLAY_NAME = "VoxCPM2"
+VOXCPM2_VOICE_PREFIX = f"{VOXCPM2_ENGINE}:"
 
 
 def normalize_tts_engine_name(tts_engine: str) -> str:
@@ -136,6 +139,7 @@ def save_config():
         _cfg["indextts2"] = indextts2
         _cfg["omnivoice"] = omnivoice
         _cfg["doubaotts"] = doubaotts
+        _cfg["voxcpm2"] = voxcpm2
         f.write(toml.dumps(_cfg))
 
 
@@ -154,6 +158,7 @@ indextts = _cfg.get("indextts", {})
 indextts2 = _cfg.get("indextts2", {})
 omnivoice = _cfg.get("omnivoice", {})
 doubaotts = _cfg.get("doubaotts", {})
+voxcpm2 = _cfg.get("voxcpm2", {})
 
 hostname = socket.gethostname()
 

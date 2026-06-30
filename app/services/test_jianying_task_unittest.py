@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.models.schema import VideoClipParams
-from app.services import jianying_draft_builder, jianying_task
+from app.services import jianying_cache_rebuild, jianying_draft_builder, jianying_task
 
 
 DraftPathPlaceholder = "##_draftpath_placeholder_0E685133-18CE-45ED-8CB8-2904A212EC80_##"
@@ -162,11 +162,16 @@ class JianyingTaskTests(unittest.TestCase):
             self.assertTrue((draft_dir / "template.tmp").exists())
             self.assertTrue((draft_dir / "draft_cover.jpg").exists())
             self.assertFalse((draft_dir / "draft_content_legacy.json").exists())
-            self.assertFalse((draft_dir / "Timelines" / "project.json").exists())
+            self.assertTrue((draft_dir / "draft_content.json").exists())
+            self.assertTrue((draft_dir / "Timelines" / "project.json").exists())
             self.assertTrue((draft_dir / "assets" / "video" / "clip_01.mp4").exists())
             self.assertTrue((draft_dir / "assets" / "audio" / audio_path.name).exists())
+            self.assertFalse((draft_dir / "key_value.json").exists())
+            self.assertFalse((draft_dir / "subdraft" / "sub_draft_config.json").exists())
 
             draft_info = json.loads((draft_dir / "draft_info.json").read_text(encoding="utf-8"))
+            self.assertTrue((draft_dir / "Timelines" / draft_info["id"] / "draft_content.json").exists())
+            self.assertTrue((draft_dir / "Timelines" / draft_info["id"] / "draft_cover.jpg").exists())
             self.assertEqual("169.0.0", draft_info["new_version"])
             self.assertEqual("NarratoAI_test", draft_info["name"])
             self.assertEqual(54, len(draft_info["materials"]))
@@ -192,6 +197,155 @@ class JianyingTaskTests(unittest.TestCase):
             root_meta = json.loads((root_path / "root_meta_info.json").read_text(encoding="utf-8"))
             self.assertEqual("NarratoAI_test", root_meta["all_draft_store"][0]["draft_name"])
             self.assertEqual(str(draft_dir / "draft_info.json"), root_meta["all_draft_store"][0]["draft_json_file"])
+
+    def test_write_plaintext_jianying_draft_adds_full_duration_corner_label(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root_path = Path(temp_dir) / "drafts"
+            output_dir = Path(temp_dir) / "task"
+            root_path.mkdir()
+            output_dir.mkdir()
+            video_path = output_dir / "source.mp4"
+            audio_path = output_dir / "audio_00_00_00,000-00_00_04,000.mp3"
+            video_path.write_bytes(b"fake source video")
+            audio_path.write_bytes(b"fake audio")
+
+            params = VideoClipParams(
+                video_origin_path=str(video_path),
+                cover_name="《镖人：风起大漠》",
+                original_volume=0.4,
+                tts_volume=0.9,
+            )
+            script = [
+                {
+                    "OST": 0,
+                    "start_time": 0.0,
+                    "duration": 4.0,
+                    "timestamp": "00:00:00,000-00:00:04,000",
+                    "video": str(video_path),
+                    "audio": str(audio_path),
+                }
+            ]
+
+            with (
+                patch.object(jianying_draft_builder, "_get_media_duration_ffprobe", return_value=4.0),
+                patch.object(
+                    jianying_draft_builder,
+                    "_get_video_metadata_ffprobe",
+                    return_value=(4_000_000, 1920, 814),
+                ),
+            ):
+                draft_path, _ = jianying_draft_builder.write_plaintext_jianying_draft(
+                    str(root_path),
+                    "NarratoAI_corner",
+                    script,
+                    params,
+                    str(output_dir),
+                )
+
+            draft_info = json.loads((Path(draft_path) / "draft_info.json").read_text(encoding="utf-8"))
+            text_materials = draft_info["materials"]["texts"]
+            self.assertEqual(1, len(text_materials))
+            text_content = json.loads(text_materials[0]["content"])
+            self.assertEqual("《镖人：风起大漠》", text_content["text"])
+            self.assertEqual(
+                "7127670164996328740",
+                text_content["styles"][0]["effectStyle"]["id"],
+            )
+            self.assertEqual(2, len(draft_info["materials"]["effects"]))
+            self.assertEqual(
+                {"text_effect"},
+                {item["type"] for item in draft_info["materials"]["effects"]},
+            )
+
+            text_tracks = [track for track in draft_info["tracks"] if track["type"] == "text"]
+            self.assertEqual(1, len(text_tracks))
+            self.assertEqual("corner_label", text_tracks[0]["name"])
+            text_segment = text_tracks[0]["segments"][0]
+            self.assertEqual(draft_info["duration"], text_segment["target_timerange"]["duration"])
+            self.assertEqual(4_000_000, text_segment["target_timerange"]["duration"])
+            self.assertEqual(3, len(text_segment["extra_material_refs"]))
+            self.assertEqual({"x": 0.4671637923454809, "y": 0.4671637923454809}, text_segment["clip"]["scale"])
+
+    def test_write_plaintext_jianying_draft_writes_cover_as_draft_cover_not_first_frame(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root_path = Path(temp_dir) / "drafts"
+            output_dir = Path(temp_dir) / "task"
+            root_path.mkdir()
+            output_dir.mkdir()
+            video_path = output_dir / "source.mp4"
+            audio_path = output_dir / "audio_00_00_00,000-00_00_04,000.mp3"
+            cover_path = output_dir / "cover.jpg"
+            video_path.write_bytes(b"fake source video")
+            audio_path.write_bytes(b"fake audio")
+            Image.new("RGB", (1242, 1656), (120, 80, 40)).save(cover_path, format="JPEG")
+
+            params = VideoClipParams(
+                video_origin_path=str(video_path),
+                cover_name="《镖人：风起大漠》",
+                original_volume=0.4,
+                tts_volume=0.9,
+            )
+            script = [
+                {
+                    "OST": 0,
+                    "start_time": 0.0,
+                    "duration": 4.0,
+                    "timestamp": "00:00:00,000-00:00:04,000",
+                    "video": str(video_path),
+                    "audio": str(audio_path),
+                }
+            ]
+
+            with (
+                patch.object(jianying_draft_builder, "_get_media_duration_ffprobe", return_value=4.0),
+                patch.object(
+                    jianying_draft_builder,
+                    "_get_video_metadata_ffprobe",
+                    return_value=(4_000_000, 1920, 814),
+                ),
+            ):
+                draft_path, _ = jianying_draft_builder.write_plaintext_jianying_draft(
+                    str(root_path),
+                    "NarratoAI_cover",
+                    script,
+                    params,
+                    str(output_dir),
+                    cover_image_path=str(cover_path),
+                )
+
+            draft_dir = Path(draft_path)
+            self.assertFalse((draft_dir / "assets" / "video" / "cover_first_frame.mp4").exists())
+            cover_resources = list((draft_dir / "Resources" / "cover").glob("*.jpg"))
+            self.assertEqual(4, len(cover_resources))
+
+            with Image.open(draft_dir / "draft_cover.jpg") as draft_cover:
+                self.assertEqual((1920, 814), draft_cover.size)
+            cover_sizes = []
+            default_cover_count = 0
+            for cover_resource in cover_resources:
+                try:
+                    with Image.open(cover_resource) as source_cover:
+                        cover_sizes.append(source_cover.size)
+                except Exception:
+                    default_cover_count += 1
+            self.assertIn((1242, 1656), cover_sizes)
+            self.assertEqual(2, cover_sizes.count((1920, 814)))
+            self.assertEqual(1, default_cover_count)
+
+            draft_info = json.loads((draft_dir / "draft_info.json").read_text(encoding="utf-8"))
+            with Image.open(draft_dir / "Timelines" / draft_info["id"] / "draft_cover.jpg") as timeline_cover:
+                self.assertEqual((1920, 814), timeline_cover.size)
+            self.assertEqual(1, len(draft_info["materials"]["videos"]))
+            self.assertEqual(4_000_000, draft_info["duration"])
+            self.assertEqual(0, draft_info["tracks"][0]["segments"][0]["target_timerange"]["start"])
+
+            draft_settings = (draft_dir / "draft_settings").read_text(encoding="utf-8")
+            self.assertIn("is_use_cover_edit=true", draft_settings)
+            self.assertIn("ai_cover_agent_prompt_text=", draft_settings)
+            self.assertFalse((draft_dir / "key_value.json").exists())
+            self.assertFalse((draft_dir / "subdraft" / "sub_draft_config.json").exists())
 
     def test_write_plaintext_jianying_draft_uses_source_timerange_and_writes_subtitles(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -264,6 +418,74 @@ class JianyingTaskTests(unittest.TestCase):
             self.assertEqual(1, len(text_tracks))
             self.assertEqual(1, len(text_tracks[0]["segments"]))
             self.assertEqual(1_500_000, text_tracks[0]["segments"][0]["target_timerange"]["duration"])
+
+    def test_write_plaintext_jianying_draft_keeps_audio_timeline_when_source_video_is_short(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root_path = Path(temp_dir) / "drafts"
+            output_dir = Path(temp_dir) / "task"
+            root_path.mkdir()
+            output_dir.mkdir()
+            video_path = output_dir / "source.mp4"
+            audio_path = output_dir / "audio_1_00_00_08,000-00_00_20,000.wav"
+            video_path.write_bytes(b"fake source video")
+            audio_path.write_bytes(b"fake audio")
+
+            params = VideoClipParams(
+                video_origin_path=str(video_path),
+                original_volume=0.4,
+                tts_volume=0.9,
+            )
+            script = [
+                {
+                    "OST": 0,
+                    "start_time": 8.0,
+                    "source_start_time": 8.0,
+                    "duration": 40.0,
+                    "timestamp": "00:00:08,000-00:00:48,000",
+                    "video": str(video_path),
+                    "audio": str(audio_path),
+                    "use_source_timerange": True,
+                }
+            ]
+
+            def fake_duration(file_path):
+                return 18.0 if file_path == str(video_path) else 40.0
+
+            with (
+                patch.object(jianying_draft_builder, "_get_media_duration_ffprobe", side_effect=fake_duration),
+                patch.object(
+                    jianying_draft_builder,
+                    "_get_video_metadata_ffprobe",
+                    return_value=(18_000_000, 1920, 1080),
+                ),
+                patch.object(
+                    jianying_draft_builder,
+                    "_create_freeze_frame_video_file",
+                    return_value=str(output_dir / "freeze_1.mp4"),
+                ) as create_freeze,
+            ):
+                (output_dir / "freeze_1.mp4").write_bytes(b"freeze")
+                draft_path, _ = jianying_draft_builder.write_plaintext_jianying_draft(
+                    str(root_path),
+                    "NarratoAI_short_source",
+                    script,
+                    params,
+                    str(output_dir),
+                )
+
+            draft_info = json.loads((Path(draft_path) / "draft_info.json").read_text(encoding="utf-8"))
+            video_segment = draft_info["tracks"][0]["segments"][0]
+            freeze_segment = draft_info["tracks"][0]["segments"][1]
+            audio_segment = draft_info["tracks"][1]["segments"][0]
+            self.assertEqual(40_000_000, draft_info["duration"])
+            self.assertEqual(2, len(draft_info["tracks"][0]["segments"]))
+            self.assertEqual(10_000_000, video_segment["target_timerange"]["duration"])
+            self.assertEqual(10_000_000, video_segment["source_timerange"]["duration"])
+            self.assertEqual(1.0, video_segment["speed"])
+            self.assertEqual(10_000_000, freeze_segment["target_timerange"]["start"])
+            self.assertEqual(30_000_000, freeze_segment["target_timerange"]["duration"])
+            self.assertEqual(40_000_000, audio_segment["target_timerange"]["duration"])
+            create_freeze.assert_called_once()
 
     def test_build_jianying_draft_script_references_original_video(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -420,6 +642,162 @@ class JianyingTaskTests(unittest.TestCase):
             self.assertEqual(str(audio_path), write_kwargs["new_script_list"][0]["audio"])
             self.assertEqual(str(subtitle_path), write_kwargs["subtitle_path"])
             self.assertEqual(str(subtitle_path), result["subtitles"][0])
+
+    def test_rebuild_jianying_draft_from_cache_reuses_existing_audio_and_generates_missing_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            root_path = temp_path / "drafts"
+            task_dir = temp_path / "task"
+            root_path.mkdir()
+            task_dir.mkdir()
+
+            video_path = temp_path / "source.mp4"
+            script_path = temp_path / "script.json"
+            cached_audio = task_dir / "audio_00_00_01,000-00_00_03,000.wav"
+            generated_audio = task_dir / "audio_00_00_04,000-00_00_06,000.wav"
+            subtitle_path = task_dir / "script_subtitles.srt"
+            video_path.write_bytes(b"video")
+            cached_audio.write_bytes(b"audio")
+            script_path.write_text(
+                json.dumps([
+                    {
+                        "_id": 1,
+                        "timestamp": "00:00:01,000-00:00:03,000",
+                        "picture": "cached",
+                        "narration": "cached narration",
+                        "OST": 0,
+                    },
+                    {
+                        "_id": 2,
+                        "timestamp": "00:00:04,000-00:00:06,000",
+                        "picture": "missing",
+                        "narration": "missing narration",
+                        "OST": 0,
+                    },
+                ], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            params = VideoClipParams(
+                video_clip_json_path=str(script_path),
+                video_origin_path=str(video_path),
+                tts_engine="edge_tts",
+                voice_name="zh-CN-YunjianNeural",
+                subtitle_enabled=True,
+                draft_name="cache_rebuild",
+            )
+            generated_tts = [{
+                "_id": 2,
+                "timestamp": "00:00:04,000-00:00:06,000",
+                "audio_file": str(generated_audio),
+                "subtitle_file": "",
+                "duration": 1.25,
+            }]
+
+            def generate_missing_tts(**kwargs):
+                generated_audio.write_bytes(b"generated")
+                return generated_tts
+
+            with (
+                patch.dict(jianying_cache_rebuild.config.ui, {"jianying_draft_path": str(root_path)}, clear=False),
+                patch.object(jianying_task.utils, "task_dir", return_value=str(task_dir)),
+                patch.object(jianying_cache_rebuild.utils, "task_dir", return_value=str(task_dir)),
+                patch.object(jianying_task, "get_media_duration_ffprobe", return_value=1.5),
+                patch.object(jianying_task.voice, "tts_multiple", side_effect=generate_missing_tts) as tts_multiple,
+                patch.object(jianying_cache_rebuild, "_create_jianying_subtitle_file", return_value=str(subtitle_path)),
+                patch.object(jianying_cache_rebuild.cover_service, "generate_cover", return_value=""),
+                patch.object(jianying_cache_rebuild, "write_plaintext_jianying_draft", return_value=(str(root_path / "draft"), "cache_rebuild")) as write_draft,
+            ):
+                result = jianying_cache_rebuild.rebuild_jianying_draft_from_cache("task-id", params)
+
+            tts_multiple.assert_called_once()
+            self.assertEqual([2], [item["_id"] for item in tts_multiple.call_args.kwargs["list_script"]])
+            script_items = write_draft.call_args.kwargs["new_script_list"]
+            self.assertEqual(str(cached_audio), script_items[0]["audio"])
+            self.assertEqual(str(generated_audio), script_items[1]["audio"])
+            self.assertEqual(str(root_path / "draft"), result["draft_path"])
+
+    def test_rebuild_jianying_draft_from_cache_regenerates_duplicate_legacy_timestamp_audio(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            root_path = temp_path / "drafts"
+            task_dir = temp_path / "task"
+            root_path.mkdir()
+            task_dir.mkdir()
+
+            video_path = temp_path / "source.mp4"
+            script_path = temp_path / "script.json"
+            legacy_audio = task_dir / "audio_00_00_01,000-00_00_03,000.wav"
+            generated_audio_1 = task_dir / "audio_1_00_00_01,000-00_00_03,000.wav"
+            generated_audio_2 = task_dir / "audio_2_00_00_01,000-00_00_03,000.wav"
+            subtitle_path = task_dir / "script_subtitles.srt"
+            video_path.write_bytes(b"video")
+            legacy_audio.write_bytes(b"legacy")
+            script_path.write_text(
+                json.dumps([
+                    {
+                        "_id": 1,
+                        "timestamp": "00:00:01,000-00:00:03,000",
+                        "picture": "first",
+                        "narration": "first narration",
+                        "OST": 0,
+                    },
+                    {
+                        "_id": 2,
+                        "timestamp": "00:00:01,000-00:00:03,000",
+                        "picture": "second",
+                        "narration": "second narration",
+                        "OST": 0,
+                    },
+                ], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            params = VideoClipParams(
+                video_clip_json_path=str(script_path),
+                video_origin_path=str(video_path),
+                tts_engine="edge_tts",
+                voice_name="zh-CN-YunjianNeural",
+                subtitle_enabled=True,
+                draft_name="cache_rebuild",
+            )
+
+            def generate_missing_tts(**kwargs):
+                generated_audio_1.write_bytes(b"generated 1")
+                generated_audio_2.write_bytes(b"generated 2")
+                return [
+                    {
+                        "_id": 1,
+                        "timestamp": "00:00:01,000-00:00:03,000",
+                        "audio_file": str(generated_audio_1),
+                        "subtitle_file": "",
+                        "duration": 1.0,
+                    },
+                    {
+                        "_id": 2,
+                        "timestamp": "00:00:01,000-00:00:03,000",
+                        "audio_file": str(generated_audio_2),
+                        "subtitle_file": "",
+                        "duration": 1.0,
+                    },
+                ]
+
+            with (
+                patch.dict(jianying_cache_rebuild.config.ui, {"jianying_draft_path": str(root_path)}, clear=False),
+                patch.object(jianying_task.utils, "task_dir", return_value=str(task_dir)),
+                patch.object(jianying_cache_rebuild.utils, "task_dir", return_value=str(task_dir)),
+                patch.object(jianying_task.voice, "tts_multiple", side_effect=generate_missing_tts) as tts_multiple,
+                patch.object(jianying_cache_rebuild, "_create_jianying_subtitle_file", return_value=str(subtitle_path)),
+                patch.object(jianying_cache_rebuild.cover_service, "generate_cover", return_value=""),
+                patch.object(jianying_cache_rebuild, "write_plaintext_jianying_draft", return_value=(str(root_path / "draft"), "cache_rebuild")) as write_draft,
+            ):
+                jianying_cache_rebuild.rebuild_jianying_draft_from_cache("task-id", params)
+
+            tts_multiple.assert_called_once()
+            self.assertEqual([1, 2], [item["_id"] for item in tts_multiple.call_args.kwargs["list_script"]])
+            script_items = write_draft.call_args.kwargs["new_script_list"]
+            self.assertEqual(str(generated_audio_1), script_items[0]["audio"])
+            self.assertEqual(str(generated_audio_2), script_items[1]["audio"])
 
 
 if __name__ == "__main__":

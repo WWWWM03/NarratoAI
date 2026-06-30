@@ -223,7 +223,16 @@ def render_generate_button():
         if not st.session_state.get('video_clip_json_path'):
             st.error(tr("Script file cannot be empty"))
             return
-        if not st.session_state.get('video_origin_path'):
+        video_origin_paths = st.session_state.get('video_origin_paths', [])
+        if isinstance(video_origin_paths, str):
+            video_origin_paths = [video_origin_paths]
+        video_origin_paths = [
+            path for path in video_origin_paths
+            if isinstance(path, str) and path.strip()
+        ]
+        if not video_origin_paths and st.session_state.get('video_origin_path'):
+            video_origin_paths = [st.session_state.get('video_origin_path')]
+        if not video_origin_paths:
             st.error(tr("Video file cannot be empty"))
             return
 
@@ -449,7 +458,17 @@ def get_jianying_export_params(draft_name=None) -> VideoClipParams:
             draft_name
             if draft_name is not None
             else st.session_state.get('draft_name_input', f"NarratoAI_{int(time.time())}")
-        )
+        ),
+        cover_enabled=config.ui.get('cover_enabled', False),
+        cover_api_url=config.ui.get('cover_api_url', 'http://127.0.0.1:8080'),
+        cover_name=(
+            st.session_state['cover_name']
+            if 'cover_name' in st.session_state
+            else config.ui.get('cover_name', '')
+        ),
+        cover_platforms=config.ui.get('cover_platforms', []),
+        cover_style_hint=config.ui.get('cover_style_hint', ''),
+        cover_use_llm=config.ui.get('cover_use_llm', True),
     )
 
 
@@ -465,16 +484,28 @@ def _render_jianying_export_status():
         st.error(f"{tr('Failed to export Jianying draft')}: {error}")
 
 
-def _render_jianying_export_dialog():
+def _render_jianying_export_dialog(export_mode=None):
     """使用弹窗确认剪映草稿名称。"""
     import uuid
     from loguru import logger
 
-    @st.dialog(tr("Export to Jianying Draft"), width="small")
+    export_mode = export_mode or st.session_state.get('jianying_export_mode', 'normal')
+    is_cache_rebuild = export_mode == 'cache_rebuild'
+    dialog_heading = tr("Rebuild Jianying Draft from Cache") if is_cache_rebuild else tr("Export to Jianying Draft")
+
+    @st.dialog(dialog_heading, width="small")
     def jianying_export_dialog():
         jianying_draft_path = config.ui.get("jianying_draft_path", "")
-        dialog_title = escape(tr("Jianying export dialog title"))
-        dialog_description = escape(tr("Jianying export dialog description"))
+        dialog_title = escape(
+            tr("Jianying cache rebuild dialog title")
+            if is_cache_rebuild
+            else tr("Jianying export dialog title")
+        )
+        dialog_description = escape(
+            tr("Jianying cache rebuild dialog description")
+            if is_cache_rebuild
+            else tr("Jianying export dialog description")
+        )
         destination_label = escape(tr("Jianying export destination"))
         destination_path = escape(jianying_draft_path or "-")
 
@@ -555,6 +586,18 @@ def _render_jianying_export_dialog():
             placeholder="NarratoAI_",
         )
 
+        cache_task_id = ""
+        if is_cache_rebuild:
+            if 'jianying_cache_task_id' not in st.session_state:
+                st.session_state['jianying_cache_task_id'] = st.session_state.get('task_id', '')
+            cache_task_id = st.text_input(
+                tr("Cache task id"),
+                key="jianying_cache_task_id",
+                placeholder=tr("Cache task id placeholder"),
+                help=tr("Cache task id help"),
+            )
+            st.caption(tr("Jianying cache rebuild note"))
+
         error = st.session_state.get('jianying_export_error')
         if error:
             st.error(f"{tr('Failed to export Jianying draft')}: {error}")
@@ -573,8 +616,27 @@ def _render_jianying_export_dialog():
                     return
 
                 # 创建任务ID
-                task_id = str(uuid.uuid4())
-                st.session_state['task_id'] = task_id
+                if is_cache_rebuild:
+                    task_id = (cache_task_id or "").strip()
+                    invalid_task_id = (
+                        not task_id
+                        or os.path.isabs(task_id)
+                        or ".." in task_id.split("/")
+                        or ".." in task_id.split("\\")
+                        or "/" in task_id
+                        or "\\" in task_id
+                    )
+                    if invalid_task_id:
+                        st.error(tr("Please enter valid cache task id"))
+                        return
+
+                    cache_task_dir = os.path.join(utils.storage_dir(), "tasks", task_id)
+                    if not os.path.isdir(cache_task_dir):
+                        st.error(tr("Cache task directory does not exist").format(path=cache_task_dir))
+                        return
+                else:
+                    task_id = str(uuid.uuid4())
+                    st.session_state['task_id'] = task_id
 
                 # 构建参数
                 try:
@@ -587,10 +649,15 @@ def _render_jianying_export_dialog():
 
                 with st.spinner(tr("Exporting to Jianying draft...")):
                     try:
-                        from app.services import jianying_task
+                        if is_cache_rebuild:
+                            from app.services import jianying_cache_rebuild
+
+                            result = jianying_cache_rebuild.rebuild_jianying_draft_from_cache(task_id, params)
+                        else:
+                            from app.services import jianying_task
 
                         # 调用导出到剪映草稿的任务
-                        result = jianying_task.start_export_jianying_draft(task_id, params)
+                            result = jianying_task.start_export_jianying_draft(task_id, params)
 
                         # 记录日志
                         logger.info(f"成功导出到剪映草稿: {result['draft_name']}")
@@ -622,13 +689,32 @@ def render_export_jianying_button():
     if 'jianying_export_error' not in st.session_state:
         st.session_state['jianying_export_error'] = None
     
-    if st.button(tr("Export to Jianying Draft"), use_container_width=True, type="secondary"):
+    export_col, cache_rebuild_col = st.columns(2)
+    with export_col:
+        start_export = st.button(tr("Export to Jianying Draft"), use_container_width=True, type="secondary")
+    with cache_rebuild_col:
+        start_cache_rebuild = st.button(
+            tr("Rebuild Jianying Draft from Cache"),
+            use_container_width=True,
+            type="secondary",
+        )
+
+    if start_export or start_cache_rebuild:
         config.save_config()
         
         if not st.session_state.get('video_clip_json_path'):
             st.error(tr("Script file cannot be empty"))
             return
-        if not st.session_state.get('video_origin_path'):
+        video_origin_paths = st.session_state.get('video_origin_paths', [])
+        if isinstance(video_origin_paths, str):
+            video_origin_paths = [video_origin_paths]
+        video_origin_paths = [
+            path for path in video_origin_paths
+            if isinstance(path, str) and path.strip()
+        ]
+        if not video_origin_paths and st.session_state.get('video_origin_path'):
+            video_origin_paths = [st.session_state.get('video_origin_path')]
+        if not video_origin_paths:
             st.error(tr("Video file cannot be empty"))
             return
         
@@ -643,8 +729,9 @@ def render_export_jianying_button():
         
         st.session_state['jianying_export_result'] = None
         st.session_state['jianying_export_error'] = None
+        st.session_state['jianying_export_mode'] = 'cache_rebuild' if start_cache_rebuild else 'normal'
         st.session_state['draft_name_input'] = f"NarratoAI_{int(time.time())}"
-        _render_jianying_export_dialog()
+        _render_jianying_export_dialog(st.session_state['jianying_export_mode'])
     
     _render_jianying_export_status()
 

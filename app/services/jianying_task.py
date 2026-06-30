@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import re
@@ -10,7 +11,7 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoClipParams
-from app.services import voice, clip_video, script_subtitle
+from app.services import voice, clip_video, script_subtitle, subtitle_resolver, cover_service
 from app.services.jianying_draft_builder import write_plaintext_jianying_draft
 from app.services import state as sm
 from app.utils import utils
@@ -80,6 +81,70 @@ def _get_cached_media_duration(media_file: str, duration_cache: Dict[str, float]
     return duration_cache[media_file]
 
 
+def _load_script_file(video_script_path: str) -> list[Dict]:
+    if not path.exists(video_script_path):
+        logger.error(f"解说脚本文件不存在: {video_script_path}，请先点击【保存脚本】按钮保存脚本后再生成视频")
+        raise ValueError("解说脚本文件不存在，请先保存脚本后再导出")
+
+    try:
+        with open(video_script_path, "r", encoding="utf-8") as f:
+            list_script = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"脚本 JSON 格式错误: {video_script_path}, line={e.lineno}, col={e.colno}, error={e.msg}")
+        raise ValueError(f"脚本 JSON 格式错误：第 {e.lineno} 行第 {e.colno} 列，{e.msg}") from e
+    except Exception as e:
+        logger.error(f"无法读取视频json脚本: {video_script_path}, {e}")
+        raise ValueError("无法读取视频json脚本，请检查脚本格式是否正确") from e
+
+    if not isinstance(list_script, list) or not list_script:
+        raise ValueError("脚本必须是非空 JSON 数组")
+
+    _validate_script_items(list_script)
+    video_script = " ".join(str(i.get("narration", "")) for i in list_script)
+    logger.debug(f"解说完整脚本: \n{video_script}")
+    logger.debug(f"解说 OST 列表: \n{[i.get('OST') for i in list_script]}")
+    logger.debug(f"解说时间戳列表: \n{[i.get('timestamp') for i in list_script]}")
+    return list_script
+
+
+def _validate_script_items(list_script: list[Dict]) -> None:
+    required_fields = ["_id", "timestamp", "narration", "OST"]
+    timestamp_pattern = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}-\d{2}:\d{2}:\d{2},\d{3}$")
+
+    seen_ids = set()
+    for index, item in enumerate(list_script, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"脚本第 {index} 项必须是对象")
+
+        missing_fields = [field for field in required_fields if field not in item]
+        if missing_fields:
+            raise ValueError(f"脚本第 {index} 项缺少字段: {', '.join(missing_fields)}")
+
+        item_id = item.get("_id")
+        if item_id in seen_ids:
+            raise ValueError(f"脚本存在重复 _id: {item_id}")
+        seen_ids.add(item_id)
+
+        timestamp = item.get("timestamp")
+        if not isinstance(timestamp, str) or not timestamp_pattern.match(timestamp):
+            raise ValueError(f"脚本第 {index} 项时间戳格式错误: {timestamp}")
+
+        try:
+            start_time, end_time = script_subtitle.parse_time_range(timestamp)
+        except ValueError as e:
+            raise ValueError(f"脚本第 {index} 项时间戳无法解析: {timestamp}") from e
+        if end_time <= start_time:
+            raise ValueError(f"脚本第 {index} 项结束时间必须大于开始时间: {timestamp}")
+
+        ost = item.get("OST")
+        if not isinstance(ost, int) or ost not in (0, 1, 2):
+            raise ValueError(f"脚本第 {index} 项 OST 必须是 0、1 或 2: {ost}")
+
+        narration = item.get("narration")
+        if not isinstance(narration, str) or not narration.strip():
+            raise ValueError(f"脚本第 {index} 项 narration 不能为空")
+
+
 def _clamp_duration_to_media(
     requested_duration: float,
     media_file: str,
@@ -124,6 +189,10 @@ def _normalize_indextts_reference_audio(params: VideoClipParams) -> None:
             return
         voice_prefix = config.OMNIVOICE_VOICE_PREFIX
         display_name = "OmniVoice"
+    elif params.tts_engine == config.VOXCPM2_ENGINE:
+        tts_config = config.voxcpm2
+        voice_prefix = config.VOXCPM2_VOICE_PREFIX
+        display_name = "VoxCPM2"
     else:
         return
 
@@ -175,6 +244,118 @@ def _resolve_tts_result(item: Dict, tts_map: Dict) -> Dict:
     if timestamp in tts_map:
         return tts_map[timestamp]
     return {}
+
+
+def _safe_audio_timestamp(timestamp: str) -> str:
+    return str(timestamp or "").replace(":", "_")
+
+
+def _find_cached_audio_file(task_id: str, item: Dict, allow_legacy_timestamp_cache: bool = True) -> str:
+    timestamp = _safe_audio_timestamp(item.get("timestamp", ""))
+    if not timestamp:
+        return ""
+
+    task_dir = utils.task_dir(task_id)
+    cache_stems = [voice.get_tts_cache_stem(item)]
+    if allow_legacy_timestamp_cache:
+        legacy_stem = voice.get_legacy_tts_cache_stem(item)
+        if legacy_stem not in cache_stems:
+            cache_stems.append(legacy_stem)
+
+    for extension in (".wav", ".mp3"):
+        for cache_stem in cache_stems:
+            audio_file = path.join(task_dir, f"{cache_stem}{extension}")
+            if path.exists(audio_file) and path.getsize(audio_file) > 0:
+                return audio_file
+    return ""
+
+
+def _build_cached_tts_results(task_id: str, list_script: list[Dict]) -> tuple[list[Dict], list[Dict]]:
+    cached_results = []
+    missing_segments = []
+    duration_cache: Dict[str, float] = {}
+    timestamp_counts: Dict[str, int] = {}
+    for item in list_script:
+        if item.get("OST") in (0, 2):
+            timestamp = item.get("timestamp", "")
+            timestamp_counts[timestamp] = timestamp_counts.get(timestamp, 0) + 1
+
+    for item in list_script:
+        if item.get("OST") not in (0, 2):
+            continue
+
+        allow_legacy_timestamp_cache = timestamp_counts.get(item.get("timestamp", ""), 0) <= 1
+        audio_file = _find_cached_audio_file(
+            task_id,
+            item,
+            allow_legacy_timestamp_cache=allow_legacy_timestamp_cache,
+        )
+        if not audio_file:
+            missing_segments.append(item)
+            continue
+
+        try:
+            duration = _get_cached_media_duration(audio_file, duration_cache)
+        except Exception as e:
+            logger.warning(f"Cached audio duration failed, regenerate _id={item.get('_id')}: {audio_file}, {e}")
+            missing_segments.append(item)
+            continue
+
+        cached_results.append({
+            "_id": item.get("_id"),
+            "timestamp": item.get("timestamp"),
+            "audio_file": audio_file,
+            "subtitle_file": "",
+            "duration": duration,
+            "text": item.get("narration", ""),
+            "from_cache": True,
+        })
+
+    return cached_results, missing_segments
+
+
+def _generate_or_reuse_tts_results(
+    task_id: str,
+    list_script: list[Dict],
+    params: VideoClipParams,
+    reuse_tts_cache: bool = False,
+) -> list[Dict]:
+    tts_segments = [
+        segment for segment in list_script
+        if segment["OST"] in [0, 2]
+    ]
+    logger.debug(f"TTS segments: {len(tts_segments)}")
+
+    if not reuse_tts_cache:
+        return voice.tts_multiple(
+            task_id=task_id,
+            list_script=tts_segments,
+            tts_engine=params.tts_engine,
+            voice_name=params.voice_name,
+            voice_rate=params.voice_rate,
+            voice_pitch=params.voice_pitch,
+        )
+
+    cached_results, missing_segments = _build_cached_tts_results(task_id, list_script)
+    logger.info(f"Reuse TTS cache: hit={len(cached_results)}, missing={len(missing_segments)}")
+
+    generated_results = []
+    if missing_segments:
+        logger.info(
+            "Regenerate missing TTS ids: "
+            + ", ".join(str(item.get("_id")) for item in missing_segments[:20])
+            + (" ..." if len(missing_segments) > 20 else "")
+        )
+        generated_results = voice.tts_multiple(
+            task_id=task_id,
+            list_script=missing_segments,
+            tts_engine=params.tts_engine,
+            voice_name=params.voice_name,
+            voice_rate=params.voice_rate,
+            voice_pitch=params.voice_pitch,
+        )
+
+    return cached_results + generated_results
 
 
 def _build_jianying_draft_script(
@@ -235,29 +416,46 @@ def _build_jianying_draft_script(
     return draft_script
 
 
-def _get_original_subtitle_paths(params: VideoClipParams) -> list[str]:
-    subtitle_paths = getattr(params, "original_subtitle_paths", []) or []
-    if isinstance(subtitle_paths, str):
-        subtitle_paths = [subtitle_paths]
+def _validate_draft_script_assets(draft_script: list[Dict]) -> None:
+    missing_video_items = []
+    missing_audio_items = []
 
-    normalized_paths = []
-    seen = set()
-    for subtitle_path in subtitle_paths:
-        if not isinstance(subtitle_path, str):
-            continue
-        subtitle_path = subtitle_path.strip()
-        if subtitle_path and subtitle_path not in seen:
-            normalized_paths.append(subtitle_path)
-            seen.add(subtitle_path)
+    for item in draft_script:
+        item_id = item.get("_id")
+        video_file = item.get("video", "")
+        if not video_file or not path.exists(video_file):
+            missing_video_items.append(f"{item_id}:{item.get('timestamp', '')}")
 
-    single_subtitle_path = str(getattr(params, "original_subtitle_path", "") or "").strip()
-    if single_subtitle_path and single_subtitle_path not in seen:
-        normalized_paths.insert(0, single_subtitle_path)
+        if item.get("OST") in (0, 2):
+            audio_file = item.get("audio", "")
+            if not audio_file or not path.exists(audio_file):
+                missing_audio_items.append(f"{item_id}:{item.get('timestamp', '')}")
 
-    if not normalized_paths:
-        normalized_paths = _find_original_subtitle_paths_for_videos(_get_video_source_paths(params))
+    if missing_video_items:
+        raise ValueError(
+            "Missing video assets: "
+            + ", ".join(missing_video_items[:30])
+            + (" ..." if len(missing_video_items) > 30 else "")
+        )
 
-    return normalized_paths
+    if missing_audio_items:
+        raise ValueError(
+            "Missing narration audio: "
+            + ", ".join(missing_audio_items[:30])
+            + (" ..." if len(missing_audio_items) > 30 else "")
+        )
+
+
+def _get_original_subtitle_paths(
+    params: VideoClipParams,
+    list_script: list[Dict] | None = None,
+) -> list[str]:
+    return subtitle_resolver.get_original_subtitle_paths(
+        params,
+        list_script=list_script,
+        video_paths=_get_video_source_paths(params),
+        log_prefix="剪映导出",
+    )
 
 
 def _video_stem_candidates(video_path: str) -> list[str]:
@@ -273,6 +471,8 @@ def _video_stem_candidates(video_path: str) -> list[str]:
 
 
 def _find_original_subtitle_paths_for_videos(video_paths: list[str]) -> list[str]:
+    return subtitle_resolver.find_original_subtitle_paths_for_videos(video_paths)
+
     subtitle_dir = utils.subtitle_dir()
     if not path.isdir(subtitle_dir):
         return []
@@ -326,7 +526,7 @@ def _create_jianying_subtitle_file(
         return script_subtitle.create_script_subtitle_file(
             task_id=task_id,
             list_script=draft_script,
-            original_subtitle_paths=_get_original_subtitle_paths(params),
+            original_subtitle_paths=_get_original_subtitle_paths(params, draft_script),
             video_origin_paths=_get_video_source_paths(params),
         )
     except Exception as e:
@@ -423,6 +623,7 @@ def start_export_jianying_draft(task_id: str, params: VideoClipParams):
             logger.debug(f"使用默认草稿名称: '{draft_name}'")
 
         output_dir = utils.task_dir(task_id)
+        cover_path = cover_service.generate_cover(task_id, params)
 
         draft_path, draft_name = write_plaintext_jianying_draft(
             jianying_draft_path=jianying_draft_path,
@@ -431,6 +632,7 @@ def start_export_jianying_draft(task_id: str, params: VideoClipParams):
             params=params,
             output_dir=output_dir,
             subtitle_path=subtitle_path,
+            cover_image_path=cover_path,
         )
         
         logger.success(f"成功导出到剪映草稿: {draft_name}")
@@ -440,6 +642,8 @@ def start_export_jianying_draft(task_id: str, params: VideoClipParams):
         task_kwargs = {"draft_path": draft_path, "draft_name": draft_name}
         if subtitle_path:
             task_kwargs["subtitles"] = [subtitle_path]
+        if cover_path:
+            task_kwargs["covers"] = [cover_path]
         sm.state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100, **task_kwargs)
         
         return task_kwargs
